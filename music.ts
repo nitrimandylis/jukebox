@@ -6,28 +6,36 @@
 // renders as real pixels via the Kitty graphics protocol (Ghostty, kitty,
 // WezTerm); everything else inherits the terminal's own theme.
 //
-// Usage: music                      live now-playing view
+// Usage: music                      the TUI (browser + player) — the main way
 //        music play [query]         pick a song and play it (no query: resume)
 //        music album <query>        pick an album, play it in order
 //        music playlist <query>     pick a playlist, play it
 //        music search <query>       list matches without playing
 //        music pause | next | prev  transport
 //        music shuffle | repeat     toggle / cycle
-// Keys (live view): space pause · n/p skip · +/- volume · s/r modes · q quit
+//
+// TUI keys: j/k move · tab or 1/2/3 switch tabs · / filter · enter play
+//           l open album/playlist · h back · ␣ pause · n/p skip
+//           +/- volume · s/r shuffle/repeat · q quit
 
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 
 const CACHE = `${tmpdir()}/music-cli`; // per-track artwork cache
 const FOOTER_MS = 6000; // keybind hints fade after this
+const TEMP_PLAYLIST = "music-cli"; // scratch playlist for album playback
 
 // ---------------------------------------------------------------------------
 // Talking to Music.app
+
+// Set by the TUI so a fatal error restores the terminal before exiting.
+let onFatal: (() => void) | null = null;
 
 function osascript(args: string[]): string {
   const res = Bun.spawnSync(["osascript", ...args], { stderr: "pipe" });
   if (res.exitCode !== 0) {
     const err = res.stderr.toString().trim();
+    onFatal?.();
     console.error(`Music.app said no: ${err}`);
     process.exit(1);
   }
@@ -39,6 +47,46 @@ function jxa(body: string): any {
   const script = `(function () { const music = Application("Music"); ${body} })()`;
   const out = osascript(["-l", "JavaScript", "-e", script]);
   return out ? JSON.parse(out) : null;
+}
+
+export type Track = {
+  id: string; name: string; artist: string; album: string;
+  albumArtist: string; disc: number; track: number; added: number;
+};
+
+// One bulk fetch per property: the whole library arrives in well under a
+// second, so the TUI never talks to Music.app while you type.
+function loadLibrary(): Track[] {
+  const rows = jxa(`
+    const tr = music.libraryPlaylists[0].tracks;
+    const names = tr.name(), artists = tr.artist(), albums = tr.album(),
+      albumArtists = tr.albumArtist(), ids = tr.persistentID(),
+      discs = tr.discNumber(), nums = tr.trackNumber(), added = tr.dateAdded();
+    return JSON.stringify(names.map((n, i) => [ids[i], n, artists[i], albums[i],
+      albumArtists[i], discs[i], nums[i], added[i]]));
+  `);
+  return rows.map((r: any[]) => ({
+    id: r[0], name: r[1] || "", artist: r[2] || "", album: r[3] || "",
+    albumArtist: r[4] || "", disc: r[5] || 0, track: r[6] || 0,
+    added: r[7] ? Date.parse(r[7]) : 0,
+  }));
+}
+
+function loadPlaylistNames(): string[] {
+  return jxa(`return JSON.stringify(music.userPlaylists.name());`)
+    .filter((n: string) => n !== TEMP_PLAYLIST);
+}
+
+function loadPlaylistTracks(name: string): Track[] {
+  const rows = jxa(`
+    const tr = music.playlists.byName(${JSON.stringify(name)}).tracks;
+    const names = tr.name(), artists = tr.artist(), albums = tr.album(), ids = tr.persistentID();
+    return JSON.stringify(names.map((n, i) => [ids[i], n, artists[i], albums[i]]));
+  `);
+  return rows.map((r: any[]) => ({
+    id: r[0], name: r[1] || "", artist: r[2] || "", album: r[3] || "",
+    albumArtist: "", disc: 0, track: 0, added: 0,
+  }));
 }
 
 type Song = { id: string; name: string; artist: string; album: string };
@@ -59,22 +107,35 @@ function searchLibrary(query: string): Song[] {
   `);
 }
 
-function playSongById(id: string) {
-  const ok = jxa(`
+function playSongById(id: string): boolean {
+  return jxa(`
     const found = music.libraryPlaylists[0].tracks.whose({ persistentID: ${JSON.stringify(id)} });
     if (found.length === 0) return JSON.stringify(false);
     found[0].play();
     return JSON.stringify(true);
   `);
-  if (!ok) {
-    console.error("that track has vanished from the library");
-    process.exit(1);
-  }
 }
 
 // Music.app has no scriptable "play these tracks": the reliable trick is a
-// throwaway playlist. Rebuild "music-cli" with the album in disc/track order
-// and play that.
+// throwaway playlist. Rebuild it with the given tracks and play — from the
+// start, or from startId when set.
+function playTracksAsPlaylist(ids: string[], startId?: string) {
+  jxa(`
+    const lib = music.libraryPlaylists[0];
+    const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
+    while (old.length > 0) music.delete(old[0]);
+    const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
+    for (const id of ${JSON.stringify(ids)}) {
+      try { music.duplicate(lib.tracks.whose({ persistentID: id })[0], { to: pl }); } catch (e) {} // skip dead tracks
+    }
+    ${startId
+      ? `try { pl.tracks.whose({ persistentID: ${JSON.stringify(startId)} })[0].play(); } catch (e) { pl.play(); }`
+      : `pl.play();`}
+    return "";
+  `);
+}
+
+// Command-line album play: no cache to hand, so resolve the album in JXA.
 function playAlbum(album: string) {
   jxa(`
     const lib = music.libraryPlaylists[0];
@@ -84,9 +145,9 @@ function playAlbum(album: string) {
     catch (e) { discs = new Array(spec.length).fill(0); nums = discs; } // dead reference in album: keep library order
     const order = discs.map((d, i) => i);
     order.sort((a, b) => (discs[a] - discs[b]) || (nums[a] - nums[b]));
-    const old = music.userPlaylists.whose({ name: "music-cli" });
+    const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
     while (old.length > 0) music.delete(old[0]);
-    const pl = music.make({ new: "playlist", withProperties: { name: "music-cli" } });
+    const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
     for (const i of order) {
       try { music.duplicate(spec[i], { to: pl }); } catch (e) {} // skip dead tracks
     }
@@ -95,8 +156,14 @@ function playAlbum(album: string) {
   `);
 }
 
-function playPlaylist(name: string) {
-  jxa(`music.playlists.byName(${JSON.stringify(name)}).play(); return "";`);
+function playPlaylist(name: string, startId?: string) {
+  jxa(`
+    const pl = music.playlists.byName(${JSON.stringify(name)});
+    ${startId
+      ? `try { pl.tracks.whose({ persistentID: ${JSON.stringify(startId)} })[0].play(); } catch (e) { pl.play(); }`
+      : `pl.play();`}
+    return "";
+  `);
 }
 
 type Now = {
@@ -177,7 +244,7 @@ function drawArt(png: string, col: number, row: number, cols: number, rows: numb
 }
 
 // ---------------------------------------------------------------------------
-// Pure rendering helpers (tested in music.test.ts)
+// Pure helpers (tested in music.test.ts)
 
 export function fmtTime(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
@@ -189,6 +256,52 @@ export function progressBar(pos: number, duration: number, width: number, color:
   const frac = duration > 0 ? Math.min(1, pos / duration) : 0;
   const filled = Math.min(width - 1, Math.floor(frac * width));
   return color + "━".repeat(filled) + "╸" + reset + dim + "─".repeat(width - filled - 1) + reset;
+}
+
+// stdin delivers fast typing and pastes as one chunk; split it back into
+// keys, keeping CSI escape sequences (arrows etc.) intact.
+export function splitKeys(chunk: string): string[] {
+  const keys: string[] = [];
+  let i = 0;
+  while (i < chunk.length) {
+    if (chunk[i] === "\x1b" && chunk[i + 1] === "[") {
+      let j = i + 2;
+      while (j < chunk.length && !(chunk[j] >= "@" && chunk[j] <= "~")) j++;
+      keys.push(chunk.slice(i, j + 1));
+      i = j + 1;
+    } else {
+      keys.push(chunk[i]);
+      i++;
+    }
+  }
+  return keys;
+}
+
+export function matches(t: { name: string; artist: string; album: string }, query: string): boolean {
+  const q = query.toLowerCase();
+  return t.name.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q) || t.album.toLowerCase().includes(q);
+}
+
+export type AlbumEntry = { name: string; artist: string; added: number; tracks: Track[] };
+
+// Group the library into albums: tracks in disc/track order, albums newest first.
+export function groupAlbums(tracks: Track[]): AlbumEntry[] {
+  const byKey = new Map<string, AlbumEntry>();
+  for (const t of tracks) {
+    if (!t.album) continue;
+    const key = `${t.album} ${t.albumArtist || t.artist}`;
+    let entry = byKey.get(key);
+    if (!entry) {
+      entry = { name: t.album, artist: t.albumArtist || t.artist, added: 0, tracks: [] };
+      byKey.set(key, entry);
+    }
+    entry.tracks.push(t);
+    entry.added = Math.max(entry.added, t.added);
+  }
+  const albums = [...byKey.values()];
+  for (const a of albums) a.tracks.sort((x, y) => (x.disc - y.disc) || (x.track - y.track));
+  albums.sort((a, b) => b.added - a.added);
+  return albums;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,134 +327,295 @@ function pick(lines: string[], header: string): number | null {
 }
 
 // ---------------------------------------------------------------------------
-// Live view: the vertical player.
+// The TUI: browse panel left (songs/albums/playlists), player right.
 
 const ESC = "\x1b[";
-const BOLD = `${ESC}1m`, DIM = `${ESC}2m`, RESET = `${ESC}0m`;
+const BOLD = `${ESC}1m`, DIM = `${ESC}2m`, REV = `${ESC}7m`, RESET = `${ESC}0m`;
 
-async function liveView() {
+const clip = (s: string, max: number) => (s.length > max ? s.slice(0, Math.max(0, max - 1)) + "…" : s);
+
+const TABS = ["songs", "albums", "playlists"] as const;
+
+async function tui() {
   if (!process.stdout.isTTY) {
-    console.error("the live view needs a terminal; try `music search <query>`");
+    console.error("the TUI needs a terminal; try `music search <query>`");
     process.exit(1);
   }
+
+  // Everything the browser shows comes from this one startup snapshot.
+  const library = loadLibrary().sort((a, b) => b.added - a.added);
+  const albums = groupAlbums(library);
+  const playlistNames = loadPlaylistNames();
+  const playlistCache = new Map<string, Track[]>();
+
   process.stdout.write(`${ESC}?1049h${ESC}?25l${ESC}2J`); // alt screen, hide cursor
   process.stdin.setRawMode(true);
   process.stdin.resume();
 
-  let lastFrame = ""; // id|size|state key; borders + art redraw only when it changes
-  let footerUntil = Date.now() + FOOTER_MS;
+  // --- state
+  let tab = 0;
+  let cursor = 0, scroll = 0;
+  let filter = "", typing = false;
+  let drill: { kind: "album" | "playlist"; title: string; tracks: Track[] } | null = null;
+  let now: Now = nowPlaying();
+  let lastFrame = ""; // art + border cache key
   let accent = "";
+  let footerUntil = Date.now() + FOOTER_MS;
 
-  const cleanup = () => {
+  const restore = () => {
     process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}?1049l${ESC}?25h`);
     process.stdin.setRawMode(false);
-    process.exit(0);
   };
+  const cleanup = () => { restore(); process.exit(0); };
+  onFatal = restore;
   process.on("SIGINT", cleanup);
 
-  const render = () => {
-    const cols = process.stdout.columns, rows = process.stdout.rows;
-    const now = nowPlaying();
-    const stopped = now.state === "stopped" || !now.id;
+  type Item = { primary: string; secondary: string; id: string };
+  const items = (): Item[] => {
+    if (drill) {
+      return drill.tracks
+        .filter((t) => !filter || matches(t, filter))
+        .map((t) => ({ primary: t.name, secondary: t.artist, id: t.id }));
+    }
+    if (tab === 0) {
+      return library
+        .filter((t) => !filter || matches(t, filter))
+        .map((t) => ({ primary: t.name, secondary: t.artist, id: t.id }));
+    }
+    if (tab === 1) {
+      return albums
+        .filter((a) => !filter || matches({ name: a.name, artist: a.artist, album: "" }, filter))
+        .map((a) => ({ primary: a.name, secondary: a.artist, id: "" }));
+    }
+    return playlistNames
+      .filter((n) => !filter || n.toLowerCase().includes(filter.toLowerCase()))
+      .map((n) => ({ primary: n, secondary: "", id: "" }));
+  };
 
-    // One lazygit-style panel: rounded border, state in the title, a divider
-    // before the status row. Art sits small and centered near the top.
-    const W = Math.min(cols - 2, 48); // panel width, borders included
-    const inner = W - 2;
-    if (cols < 24 || rows < 13) {
+  // Map a filtered index back to the unfiltered collection.
+  const selected = <T,>(all: T[], match: (x: T) => boolean): T | undefined =>
+    all.filter(match)[cursor];
+
+  const draw = () => {
+    const cols = process.stdout.columns, rows = process.stdout.rows;
+    if (cols < 40 || rows < 13) {
       process.stdout.write(`${ESC}2J${ESC}1;1H${DIM}terminal too small${RESET}`);
       lastFrame = "";
       return;
     }
-    let artA = Math.min(inner - 8, (rows - 15) * 2, 28); // quarter-scale cover
-    artA -= artA % 2;
-    const showArt = !stopped && artA >= 10;
-    const artH = showArt ? artA / 2 : 0;
-    const panelH = artH + 11;
-    const left = Math.max(1, Math.floor((cols - W) / 2) + 1);
-    const top = Math.max(1, Math.floor((rows - panelH - 2) / 2) + 1);
+    const H = rows - 1; // panels; last row is the footer
+    const wide = cols >= 72;
+    const R = wide ? 38 : Math.min(cols, 48); // player panel width
+    const L = wide ? cols - R : 0; // browse panel width
+    const playerX = wide ? L + 1 : Math.max(1, Math.floor((cols - R) / 2) + 1);
+    const stopped = now.state === "stopped" || !now.id;
 
-    const at = (y: number, text: string) => process.stdout.write(`${ESC}${y};${left}H${text}`);
-    const boxRow = (y: number, text = "", visible = 0) => {
-      const fill = " ".repeat(Math.max(0, inner - 2 - visible));
-      at(y, `${DIM}│${RESET} ${text}${fill} ${DIM}│${RESET}`);
-    };
-    const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) + "…" : s);
-
-    // Rows inside the panel, top border = `top`.
-    const artTop = top + 2;
-    const nameRow = artTop + artH + 1;
-    const barRow = nameRow + 3;
-    const divRow = barRow + 2;
     const frame = `${now.id}|${cols}x${rows}|${stopped}`;
-
-    if (frame !== lastFrame) {
+    const newFrame = frame !== lastFrame;
+    if (newFrame) {
       process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}2J`);
-      for (let y = top + 1; y < top + panelH - 1; y++) boxRow(y);
-      at(divRow, DIM + "├" + "─".repeat(inner) + "┤" + RESET);
-      at(top + panelH - 1, DIM + "╰" + "─".repeat(inner) + "╯" + RESET);
-      if (showArt) {
+      lastFrame = frame;
+    }
+
+    const at = (x: number, y: number, text: string) => process.stdout.write(`${ESC}${y};${x}H${text}`);
+
+    // ---- browse panel (hidden when the window is too narrow)
+    if (wide) {
+      const inner = L - 2;
+      const list = items();
+      const visible = H - 3; // minus borders and the filter row
+      cursor = Math.max(0, Math.min(cursor, list.length - 1));
+      if (cursor < scroll) scroll = cursor;
+      if (cursor >= scroll + visible) scroll = cursor - visible + 1;
+      scroll = Math.max(0, Math.min(scroll, Math.max(0, list.length - visible)));
+
+      // Title: the tab strip, or the drilled-into thing.
+      let title: string;
+      if (drill) {
+        title = `${TABS[tab]} ▸ ${clip(drill.title, inner - TABS[tab].length - 8)}`;
+        at(1, 1, `${DIM}╭─ ${RESET}${BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+      } else {
+        const strip = TABS.map((t, i) => (i === tab ? `${RESET}${accent || BOLD}${t}${RESET}${DIM}` : t)).join(" · ");
+        title = TABS.join(" · ");
+        at(1, 1, `${DIM}╭─ ${strip} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+      }
+
+      for (let i = 0; i < visible; i++) {
+        const y = 2 + i;
+        const item = list[scroll + i];
+        let content: string;
+        if (!item) {
+          content = scroll + i === 0 && list.length === 0 ? ` ${DIM}no matches${RESET}` + " ".repeat(inner - 11) : " ".repeat(inner);
+        } else {
+          const isCursor = scroll + i === cursor;
+          const playing = item.id && item.id === now.id ? "♪ " : "  ";
+          const primary = clip(item.primary, inner - 4);
+          const room = inner - 4 - primary.length;
+          const secondary = item.secondary && room > 4 ? "  " + clip(item.secondary, room - 2) : "";
+          const pad = " ".repeat(Math.max(0, inner - 4 - primary.length - secondary.length));
+          content = isCursor
+            ? `${REV} ${playing}${primary}${secondary}${pad} ${RESET}`
+            : ` ${item.id && item.id === now.id ? (accent || BOLD) + playing + RESET : playing}${primary}${DIM}${secondary}${RESET}${pad} `;
+        }
+        at(1, y, `${DIM}│${RESET}${content}${DIM}│${RESET}`);
+      }
+
+      // Filter row: live input, or a hint, plus the match count.
+      const count = `${list.length}`;
+      const fLeft = clip(typing ? `/ ${filter}█` : filter ? `/ ${filter}` : "/ to filter", inner - count.length - 3);
+      const fPad = " ".repeat(Math.max(0, inner - 2 - fLeft.length - count.length));
+      at(1, H - 1, `${DIM}│${RESET} ${typing ? RESET : DIM}${fLeft}${RESET}${fPad}${DIM}${count} │${RESET}`);
+      at(1, H, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
+    }
+
+    // ---- player panel
+    {
+      const W = R, inner = W - 2, x = playerX;
+      let artA = Math.min(inner - 6, (H - 13) * 2, 28);
+      artA -= artA % 2;
+      const showArt = !stopped && artA >= 10;
+      const artH = showArt ? artA / 2 : 0;
+
+      const box = (y: number, text = "", visibleLen = 0) => {
+        const fill = " ".repeat(Math.max(0, inner - 2 - visibleLen));
+        at(x, y, `${DIM}│${RESET} ${text}${fill} ${DIM}│${RESET}`);
+      };
+
+      const title = stopped ? "◼ stopped" : now.state === "paused" ? "▮▮ paused" : "♪ playing";
+      at(x, 1, `${DIM}╭─ ${RESET}${accent || BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+      for (let y = 2; y < H; y++) box(y);
+      at(x, H - 2, `${DIM}├${"─".repeat(inner)}┤${RESET}`);
+      at(x, H, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
+
+      if (newFrame && showArt) {
         const art = fetchArt(now.id);
         if (art) {
-          drawArt(art.png, left + 1 + Math.floor((inner - artA) / 2), artTop, artA, artH);
+          drawArt(art.png, x + 1 + Math.floor((inner - artA) / 2), 3, artA, artH);
           const [r, g, b] = liftAccent(art.accent);
           accent = `${ESC}38;2;${r};${g};${b}m`;
         } else {
           accent = "";
         }
       }
-      lastFrame = frame;
+
+      if (stopped) {
+        const msg = "nothing playing";
+        box(Math.floor(H / 2), DIM + msg + RESET, msg.length);
+      } else {
+        const infoY = showArt ? 3 + artH + 1 : 3;
+        const name = clip(now.name, inner - 2);
+        const artistAlbum = clip(`${now.artist} — ${now.album}`, inner - 2);
+        box(infoY, BOLD + name + RESET, name.length);
+        box(infoY + 1, DIM + artistAlbum + RESET, artistAlbum.length);
+        const barW = inner - 2;
+        box(infoY + 3, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET), barW);
+        const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
+        box(infoY + 4, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
+      }
+      const status = `⇄ ${now.shuffle ? "on" : "off"}   ↻ ${now.repeat}   vol ${now.vol}`;
+      box(H - 1, DIM + status + RESET, status.length);
     }
 
-    // Title carries the player state, tinted with the cover's accent.
-    const title = stopped ? "◼ stopped" : now.state === "paused" ? "▮▮ paused" : "♪ playing";
-    at(top, `${DIM}╭─ ${RESET}${accent || BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+    // ---- footer
+    const hints = wide
+      ? "enter play · l open · h back · / filter · ⇥ tabs · ␣ n p · q quit"
+      : "␣ pause · n/p skip · +/- vol · q quit (widen for the browser)";
+    at(1, rows, `${ESC}2K` + (Date.now() < footerUntil ? " " + DIM + clip(hints, cols - 2) + RESET : ""));
+  };
 
-    if (stopped) {
-      const msg = "nothing playing — music play <query>";
-      boxRow(nameRow, DIM + clip(msg, inner - 2) + RESET, Math.min(msg.length, inner - 2));
-      boxRow(top + panelH - 2, "");
+  const tick = () => { now = nowPlaying(); draw(); };
+  // Music.app applies sets asynchronously; poll again shortly after acting
+  // so the panel catches up.
+  const act = (body: string) => { jxa(body + `; return "";`); tick(); setTimeout(tick, 400); };
+  const resetList = () => { cursor = 0; scroll = 0; filter = ""; typing = false; };
+
+  const openSelection = () => {
+    if (drill || tab === 0) return; // songs don't drill
+    if (tab === 1) {
+      const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
+      if (!a) return;
+      drill = { kind: "album", title: a.name, tracks: a.tracks };
+    } else {
+      const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
+      if (!name) return;
+      if (!playlistCache.has(name)) playlistCache.set(name, loadPlaylistTracks(name));
+      drill = { kind: "playlist", title: name, tracks: playlistCache.get(name)! };
+    }
+    resetList();
+    draw();
+  };
+
+  const playSelection = () => {
+    if (drill) {
+      const t = selected(drill.tracks, (x) => !filter || matches(x, filter));
+      if (!t) return;
+      if (drill.kind === "album") playTracksAsPlaylist(drill.tracks.map((x) => x.id), t.id);
+      else playPlaylist(drill.title, t.id);
+    } else if (tab === 0) {
+      const t = selected(library, (x) => !filter || matches(x, filter));
+      if (t) playSongById(t.id);
+    } else if (tab === 1) {
+      const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
+      if (a) playTracksAsPlaylist(a.tracks.map((x) => x.id));
+    } else {
+      const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
+      if (name) playPlaylist(name);
+    }
+    tick();
+    setTimeout(tick, 600); // give Music.app a beat, then show the new track
+  };
+
+  process.stdin.on("data", (chunk: Buffer) => {
+    for (const k of splitKeys(chunk.toString())) handleKey(k);
+  });
+
+  const handleKey = (k: string) => {
+    footerUntil = Date.now() + FOOTER_MS;
+    if (k === "\x03") cleanup(); // ctrl-c always wins
+
+    if (typing) {
+      if (k === "\x1b") { typing = false; filter = ""; cursor = 0; scroll = 0; }
+      else if (k === "\r") typing = false;
+      else if (k === "\x7f") filter = filter.slice(0, -1);
+      else if (k >= " " && k.length === 1) { filter += k; cursor = 0; scroll = 0; }
+      draw();
       return;
     }
 
-    const name = clip(now.name, inner - 2);
-    const artistAlbum = clip(`${now.artist} — ${now.album}`, inner - 2);
-    boxRow(nameRow, BOLD + name + RESET, name.length);
-    boxRow(nameRow + 1, DIM + artistAlbum + RESET, artistAlbum.length);
-    const barW = inner - 2;
-    boxRow(barRow, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET), barW);
-    const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
-    boxRow(barRow + 1, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
-    const status = `⇄ ${now.shuffle ? "on" : "off"}   ↻ ${now.repeat}   vol ${now.vol}`;
-    boxRow(divRow + 1, DIM + status + RESET, status.length);
-    const hints = "␣ pause · n/p skip · +/- vol · s/r · q quit";
-    at(top + panelH + 1, `${ESC}2K` + (Date.now() < footerUntil ? DIM + clip(hints, W) + RESET : ""));
+    switch (k) {
+      case "j": case `${ESC}B`: cursor++; break;
+      case "k": case `${ESC}A`: cursor--; break;
+      case "g": cursor = 0; break;
+      case "G": cursor = Infinity; break;
+      case "\t": tab = (tab + 1) % 3; drill = null; resetList(); break;
+      case "1": case "2": case "3": tab = +k - 1; drill = null; resetList(); break;
+      case "/": typing = true; filter = ""; cursor = 0; scroll = 0; break;
+      case "l": case `${ESC}C`: openSelection(); return;
+      case "h": case `${ESC}D`: case "\x1b":
+        if (drill) { drill = null; resetList(); }
+        else if (filter) { filter = ""; cursor = 0; scroll = 0; }
+        break;
+      case "\r": playSelection(); return;
+      case " ": act("music.playpause()"); return;
+      case "n": act("music.nextTrack()"); return;
+      case "p": act("music.backTrack()"); return;
+      case "+": case "=": act("music.soundVolume = Math.min(100, music.soundVolume() + 5)"); return;
+      case "-": act("music.soundVolume = Math.max(0, music.soundVolume() - 5)"); return;
+      case "s": act("const v = !music.shuffleEnabled(); music.shuffleEnabled = v"); return;
+      case "r": act(`music.songRepeat = { off: "all", all: "one", one: "off" }[music.songRepeat()]`); return;
+      case "q": cleanup();
+      default: return;
+    }
+    draw();
   };
 
-  // Music.app applies sets asynchronously; render now and again shortly
-  // after so the status line catches up.
-  const act = (body: string) => { jxa(body + `; return "";`); render(); setTimeout(render, 400); };
-  process.stdin.on("data", (key: Buffer) => {
-    footerUntil = Date.now() + FOOTER_MS; // any key brings the hints back
-    switch (key.toString()) {
-      case " ": act("music.playpause()"); break;
-      case "n": act("music.nextTrack()"); break;
-      case "p": act("music.backTrack()"); break;
-      case "+": case "=": act("music.soundVolume = Math.min(100, music.soundVolume() + 5)"); break;
-      case "-": act("music.soundVolume = Math.max(0, music.soundVolume() - 5)"); break;
-      case "s": act("music.shuffleEnabled = !music.shuffleEnabled()"); break;
-      case "r": act(`music.songRepeat = { off: "all", all: "one", one: "off" }[music.songRepeat()]`); break;
-      case "q": case "\x03": cleanup();
-    }
-  });
-
-  process.stdout.on("resize", () => { lastArtId = ""; render(); });
-  render();
-  setInterval(render, 1000);
+  process.stdout.on("resize", () => { lastFrame = ""; draw(); });
+  tick();
+  setInterval(tick, 1000);
 }
 
 // ---------------------------------------------------------------------------
-// Commands
+// Commands (the extras — the TUI is the main way in)
 
 function requireQuery(query: string, usage: string): string {
   if (!query) { console.error(usage); process.exit(1); }
@@ -358,7 +632,7 @@ function main() {
 
   switch (cmd) {
     case undefined: {
-      liveView();
+      tui();
       return; // keeps the event loop alive
     }
     case "play": {
@@ -367,7 +641,10 @@ function main() {
       if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
       const i = pick(songs.map(songLabel), "play");
       if (i === null) return;
-      playSongById(songs[i].id);
+      if (!playSongById(songs[i].id)) {
+        console.error("that track has vanished from the library");
+        process.exit(1);
+      }
       console.log(`▶ ${songs[i].name} — ${songs[i].artist}`);
       break;
     }
@@ -386,8 +663,7 @@ function main() {
     case "playlist": {
       requireQuery(query, "usage: music playlist <query>");
       const q = query.toLowerCase();
-      const names: string[] = jxa(`return JSON.stringify(music.userPlaylists.name());`)
-        .filter((n: string) => n.toLowerCase().includes(q) && n !== "music-cli");
+      const names: string[] = loadPlaylistNames().filter((n: string) => n.toLowerCase().includes(q));
       if (names.length === 0) { console.error(`no playlist matches "${query}"`); process.exit(1); }
       const i = pick(names, "playlist");
       if (i === null) return;

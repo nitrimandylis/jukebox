@@ -9,14 +9,17 @@ register: product (a tool — design serves the product)
 
 ## What it is
 
-- **Quick commands**: `music play <query>` (fzf-pick a song), `music album` /
-  `music playlist` (pick and play whole), `music pause|next|prev`,
+- **The TUI is the main way in**: bare `music` opens a two-panel app,
+  lazygit-style. Left: a browser with songs / albums / playlists tabs — the
+  whole library is bulk-fetched once at startup (~0.2s for ~1700 tracks) and
+  filtered locally with `/`, newest additions first. Enter plays; `l` drills
+  into an album/playlist and enter inside plays it from that track. Right:
+  the now-playing panel — album art as real pixels (Kitty graphics), progress
+  bar tinted with the cover's dominant color, shuffle/repeat/volume status.
+  Transport keys are global: space pause, n/p skip, +/- volume, s/r modes.
+- **Quick commands are the extras**: `music play <query>` (fzf-pick a song),
+  `music album` / `music playlist` (pick and play whole), `music pause|next|prev`,
   `music shuffle|repeat`, `music search <query>`.
-- **Live player**: bare `music` opens a vertical now-playing view — album art
-  rendered as real pixels (Kitty graphics protocol, Ghostty), title/artist,
-  ticking progress bar tinted with the album art's dominant color, a dim
-  status line (shuffle/repeat/volume), and a keybind hint footer that fades
-  after a few seconds. Everything else inherits the terminal's own theme.
 
 ## Design stance
 

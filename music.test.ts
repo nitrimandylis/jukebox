@@ -1,5 +1,36 @@
 import { expect, test } from "bun:test";
-import { fmtTime, progressBar, bmpPixel, liftAccent } from "./music.ts";
+import { fmtTime, progressBar, bmpPixel, liftAccent, matches, groupAlbums, type Track } from "./music.ts";
+
+const track = (over: Partial<Track>): Track => ({
+  id: "X", name: "", artist: "", album: "", albumArtist: "", disc: 1, track: 1, added: 0, ...over,
+});
+
+test("splitKeys separates batched input, keeps escape sequences whole", () => {
+  const { splitKeys } = require("./music.ts");
+  expect(splitKeys("/gnx")).toEqual(["/", "g", "n", "x"]);
+  expect(splitKeys("\x1b[A\x1b[Bj")).toEqual(["\x1b[A", "\x1b[B", "j"]);
+  expect(splitKeys("\x1b")).toEqual(["\x1b"]); // lone esc
+});
+
+test("matches is case-insensitive across name/artist/album", () => {
+  const t = track({ name: "Not Like Us", artist: "Kendrick Lamar", album: "GNX" });
+  expect(matches(t, "kendrick")).toBe(true);
+  expect(matches(t, "gnx")).toBe(true);
+  expect(matches(t, "LIKE US")).toBe(true);
+  expect(matches(t, "drake")).toBe(false);
+});
+
+test("groupAlbums sorts tracks by disc/track and albums newest-first", () => {
+  const albums = groupAlbums([
+    track({ id: "a2", album: "Old", track: 2, added: 100 }),
+    track({ id: "a1", album: "Old", track: 1, added: 50 }),
+    track({ id: "b1", album: "New", added: 999, albumArtist: "Someone" }),
+    track({ id: "nope", album: "" }), // no album — dropped
+  ]);
+  expect(albums.map((a) => a.name)).toEqual(["New", "Old"]);
+  expect(albums[1].tracks.map((t) => t.id)).toEqual(["a1", "a2"]);
+  expect(albums[0].artist).toBe("Someone");
+});
 
 test("fmtTime", () => {
   expect(fmtTime(0)).toBe("0:00");
