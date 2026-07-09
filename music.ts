@@ -17,7 +17,7 @@
 //        music shuffle | repeat     toggle / cycle
 //
 // TUI keys: j/k move · tab or 1/2/3 switch tabs · / filter · enter play
-//           l open album/playlist · h back · ␣ pause · n/p skip
+//           l open album/playlist · h back · ␣ pause · ←/→ prev/next track
 //           +/- volume · s/r shuffle/repeat · q quit
 
 import { existsSync, mkdirSync, readFileSync } from "fs";
@@ -597,8 +597,8 @@ async function tui() {
 
     // ---- footer
     const hints = wide
-      ? "enter play · l open · h back · / filter · ⇥ tabs · ␣ n p · q quit"
-      : "␣ pause · n/p skip · +/- vol · q quit (widen for the browser)";
+      ? "enter play · l open · h back · / filter · ⇥ tabs · ␣ pause · ←/→ skip · q quit"
+      : "␣ pause · ←/→ skip · +/- vol · q quit (widen for the browser)";
     at(1, rows, `${ESC}2K` + (Date.now() < footerUntil ? " " + DIM + clip(hints, cols - 2) + RESET : ""));
   };
 
@@ -669,15 +669,15 @@ async function tui() {
       case "\t": tab = (tab + 1) % 3; drill = null; resetList(); break;
       case "1": case "2": case "3": tab = +k - 1; drill = null; resetList(); break;
       case "/": typing = true; filter = ""; cursor = 0; scroll = 0; break;
-      case "l": case `${ESC}C`: openSelection(); return;
-      case "h": case `${ESC}D`: case "\x1b":
+      case "l": openSelection(); return;
+      case "h": case "\x1b":
         if (drill) { drill = null; resetList(); }
         else if (filter) { filter = ""; cursor = 0; scroll = 0; }
         break;
       case "\r": playSelection(); return;
       case " ": act("music.playpause()"); return;
-      case "n": act("music.nextTrack()"); return;
-      case "p": act("music.backTrack()"); return;
+      case `${ESC}C`: act("music.nextTrack()"); return;
+      case `${ESC}D`: act("music.backTrack()"); return;
       case "+": case "=": act("music.soundVolume = Math.min(100, music.soundVolume() + 5)"); return;
       case "-": act("music.soundVolume = Math.max(0, music.soundVolume() - 5)"); return;
       case "s": act("const v = !music.shuffleEnabled(); music.shuffleEnabled = v"); return;
