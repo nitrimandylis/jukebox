@@ -440,6 +440,7 @@ async function tui() {
   let lastFrame = ""; // art + border cache key
   let accent = "";
   let footerUntil = Date.now() + FOOTER_MS;
+  let flashKey = "", flashUntil = 0; // status item to show briefly after its key
 
   const restore = () => {
     process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}?1049l${ESC}?25h`);
@@ -564,7 +565,6 @@ async function tui() {
       const title = stopped ? "◼ stopped" : now.state === "paused" ? "▮▮ paused" : "♪ playing";
       at(x, 1, `${DIM}╭─ ${RESET}${accent || BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
       for (let y = 2; y < H; y++) box(y);
-      at(x, H - 2, `${DIM}├${"─".repeat(inner)}┤${RESET}`);
       at(x, H, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
 
       if (newFrame && showArt) {
@@ -592,21 +592,37 @@ async function tui() {
         const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
         box(infoY + 4, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
       }
-      const status = `⇄ ${now.shuffle ? "on" : "off"}   ↻ ${now.repeat}   vol ${now.vol}`;
-      box(H - 1, DIM + status + RESET, status.length);
+      // Status items earn their space only when non-default — or for a
+      // moment after their key was pressed, so toggling back to default
+      // still gives feedback.
+      const flashing = (k: string) => flashKey === k && Date.now() < flashUntil;
+      const items: string[] = [];
+      if (now.shuffle || flashing("shuffle")) items.push(`⇄ ${now.shuffle ? "on" : "off"}`);
+      if (now.repeat !== "off" || flashing("repeat")) items.push(`↻ ${now.repeat}`);
+      if (now.vol !== 100 || flashing("vol")) items.push(`vol ${now.vol}`);
+      if (items.length > 0) {
+        at(x, H - 2, `${DIM}├${"─".repeat(inner)}┤${RESET}`);
+        const status = items.join("   ");
+        box(H - 1, DIM + status + RESET, status.length);
+      }
     }
 
     // ---- footer
     const hints = wide
-      ? "enter play · l open · h back · / filter · ⇥ tabs · ␣ pause · ←/→ skip · q quit"
-      : "␣ pause · ←/→ skip · +/- vol · q quit (widen for the browser)";
+      ? "enter play · l open · h back · / filter · ⇥ tabs · ␣ pause · ←/→ skip · +/- vol · s/r modes · q quit"
+      : "␣ pause · ←/→ skip · +/- vol · s/r modes · q quit (widen for the browser)";
     at(1, rows, `${ESC}2K` + (Date.now() < footerUntil ? " " + DIM + clip(hints, cols - 2) + RESET : ""));
   };
 
   const tick = () => { now = nowPlaying(); draw(); };
   // Music.app applies sets asynchronously; poll again shortly after acting
   // so the panel catches up.
-  const act = (body: string) => { jxa(body + `; return "";`); tick(); setTimeout(tick, 400); };
+  const act = (body: string, flash = "") => {
+    if (flash) { flashKey = flash; flashUntil = Date.now() + 2500; }
+    jxa(body + `; return "";`);
+    tick();
+    setTimeout(tick, 400);
+  };
   const resetList = () => { cursor = 0; scroll = 0; filter = ""; typing = false; };
 
   const openSelection = () => {
@@ -679,10 +695,10 @@ async function tui() {
       case " ": act("music.playpause()"); return;
       case `${ESC}C`: act("music.nextTrack()"); return;
       case `${ESC}D`: act("music.backTrack()"); return;
-      case "+": case "=": act("music.soundVolume = Math.min(100, music.soundVolume() + 5)"); return;
-      case "-": act("music.soundVolume = Math.max(0, music.soundVolume() - 5)"); return;
-      case "s": act("const v = !music.shuffleEnabled(); music.shuffleEnabled = v"); return;
-      case "r": act(`music.songRepeat = { off: "all", all: "one", one: "off" }[music.songRepeat()]`); return;
+      case "+": case "=": act("music.soundVolume = Math.min(100, music.soundVolume() + 5)", "vol"); return;
+      case "-": act("music.soundVolume = Math.max(0, music.soundVolume() - 5)", "vol"); return;
+      case "s": act("const v = !music.shuffleEnabled(); music.shuffleEnabled = v", "shuffle"); return;
+      case "r": act(`music.songRepeat = { off: "all", all: "one", one: "off" }[music.songRepeat()]`, "repeat"); return;
       case "q": cleanup();
       default: return;
     }
@@ -701,6 +717,31 @@ function requireQuery(query: string, usage: string): string {
   if (!query) { console.error(usage); process.exit(1); }
   return query;
 }
+
+const HELP = `music — Apple Music for the terminal
+
+usage: music [command] [query]
+
+commands:
+  (none)            open the TUI
+  play [query]      pick a song and play it (no query: resume playback)
+  queue [query]     pick songs to play next (no query: show the queue)
+  play -q <query>   same as queue
+  album <query>     pick an album, play it in order
+  playlist <query>  pick a playlist, play it
+  search <query>    list matching songs without playing
+  pause             toggle play/pause
+  next, prev        skip to the next / previous track
+  shuffle           toggle shuffle
+  repeat            cycle repeat (off → all → one)
+
+options:
+  -h, --help        show this help
+
+TUI keys:
+  j/k or ↑/↓ move · enter play · l open album/playlist · h back
+  tab or 1/2/3 switch tabs · / filter · esc clear
+  space pause · ←/→ prev/next · +/- volume · s shuffle · r repeat · q quit`;
 
 function songLabel(s: Song): string {
   return `${s.name}  ${DIM}${s.artist} — ${s.album}${RESET}`;
@@ -790,9 +831,13 @@ function main() {
       console.log(`repeat ${mode}`);
       break;
     }
+    case "-h": case "--help": case "help":
+      console.log(HELP);
+      break;
     default:
-      console.error("usage: music [play|queue|album|playlist|search|pause|next|prev|shuffle|repeat] [query]");
-      process.exit(cmd ? 1 : 0);
+      console.error(`music: unknown command '${cmd}'`);
+      console.error("try 'music --help'");
+      process.exit(1);
   }
 }
 
