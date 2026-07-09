@@ -18,7 +18,9 @@ register: product (a tool — design serves the product)
   bar tinted with the cover's dominant color, shuffle/repeat/volume status.
   The player also shows a dim details line (genre · year · plays · ♥) and an
   "up next" section fed by the current play context, refreshed only when the
-  context changes. Status items (shuffle/repeat/volume) appear only when
+  context changes. `y` swaps that section for lyrics (lrclib.net, keyless,
+  time-synced when available — the current line highlights and auto-scrolls;
+  cached per track, fetched only while the view is open). Status items (shuffle/repeat/volume) appear only when
   non-default, flashing briefly after their key. Transport keys are global:
   space pause, ←/→ skip, +/- volume, s/r modes.
 - **Quick commands are the extras**: `music play <query>` (fzf-pick a song),

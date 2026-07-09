@@ -17,8 +17,8 @@
 //        music shuffle | repeat     toggle / cycle
 //
 // TUI keys: j/k move · tab or 1/2/3 switch tabs · / filter · enter play
-//           l open album/playlist · h back · ␣ pause · ←/→ prev/next track
-//           +/- volume · s/r shuffle/repeat · q quit
+//           l open album/playlist · h back · y lyrics · ␣ pause
+//           ←/→ prev/next track · +/- volume · s/r shuffle/repeat · q quit
 
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
@@ -326,6 +326,59 @@ function drawArt(png: string, col: number, row: number, cols: number, rows: numb
 }
 
 // ---------------------------------------------------------------------------
+// Lyrics: Music.app never exposes Apple Music's streaming lyrics, so they
+// come from lrclib.net (free, keyless, time-synced). Fetched only when the
+// lyrics view is open; cached per track next to the artwork.
+
+export type LyricLine = { t: number; text: string };
+
+// "[01:23.45] line" → { t: 83.45, text: "line" }; plain text → t: -1.
+export function parseLyrics(synced: string | null, plain: string | null): LyricLine[] {
+  if (synced) {
+    const lines: LyricLine[] = [];
+    for (const raw of synced.split("\n")) {
+      const m = raw.match(/^\s*\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$/);
+      if (m) lines.push({ t: parseInt(m[1]) * 60 + parseFloat(m[2]), text: m[3] });
+    }
+    if (lines.length > 0) return lines;
+  }
+  if (plain) return plain.split("\n").map((text) => ({ t: -1, text }));
+  return [];
+}
+
+async function fetchLyrics(now: Now): Promise<LyricLine[]> {
+  const safe = now.id.replace(/[^A-Za-z0-9]/g, "");
+  const cache = `${CACHE}/${safe}.lyrics.json`;
+  if (existsSync(cache)) return JSON.parse(readFileSync(cache, "utf8"));
+  mkdirSync(CACHE, { recursive: true });
+  const headers = { "User-Agent": "music-cli (terminal Apple Music player)" };
+  let lines: LyricLine[] = [];
+  let definitive = true; // only cache real answers, not network failures
+  try {
+    const params = new URLSearchParams({
+      track_name: now.name, artist_name: now.artist,
+      album_name: now.album, duration: String(Math.round(now.duration)),
+    });
+    const res = await fetch(`https://lrclib.net/api/get?${params}`, { headers, signal: AbortSignal.timeout(10000) });
+    if (res.ok) {
+      const data: any = await res.json();
+      lines = parseLyrics(data.syncedLyrics, data.plainLyrics);
+    } else {
+      // exact match missed — search and take the closest duration
+      const sp = new URLSearchParams({ track_name: now.name, artist_name: now.artist });
+      const sr = await fetch(`https://lrclib.net/api/search?${sp}`, { headers, signal: AbortSignal.timeout(10000) });
+      if (sr.ok) {
+        const all: any[] = await sr.json();
+        const best = all.find((r) => Math.abs((r.duration || 0) - now.duration) < 10) || all[0];
+        if (best) lines = parseLyrics(best.syncedLyrics, best.plainLyrics);
+      }
+    }
+  } catch (e) { definitive = false; } // offline or lrclib slow: retry next open
+  if (definitive) Bun.write(cache, JSON.stringify(lines));
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
 // Pure helpers (tested in music.test.ts)
 
 export function fmtTime(seconds: number): string {
@@ -357,6 +410,19 @@ export function splitKeys(chunk: string): string[] {
     }
   }
   return keys;
+}
+
+// Greedy word-wrap; the renderer clips any single word wider than `width`.
+export function wrapText(text: string, width: number): string[] {
+  if (!text) return [""];
+  const rows: string[] = [];
+  let cur = "";
+  for (const w of text.split(" ")) {
+    if (cur && cur.length + 1 + w.length > width) { rows.push(cur); cur = w; }
+    else cur = cur ? `${cur} ${w}` : w;
+  }
+  rows.push(cur);
+  return rows;
 }
 
 export function matches(t: { name: string; artist: string; album: string }, query: string): boolean {
@@ -464,6 +530,8 @@ async function tui() {
   let flashKey = "", flashUntil = 0; // status item to show briefly after its key
   let ctx: { ids: string[]; names: string[]; artists: string[] } = { ids: [], names: [], artists: [] };
   let ctxKey = ""; // play-context cache: refetch only when the context changes
+  let lyricsMode = false;
+  let lyr: { id: string; lines: LyricLine[]; loading?: boolean } | null = null;
 
   const restore = () => {
     process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}?1049l${ESC}?25h`);
@@ -620,19 +688,53 @@ async function tui() {
         const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
         box(infoY + 5, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
 
-        // Up next: whatever rows remain, straight from the play context.
+        // The section below the times: lyrics when toggled on, up next otherwise.
         const nextY = infoY + 7;
         const room = H - 3 - nextY; // keep the bottom rows for the status section
-        const curIdx = ctx.ids.indexOf(now.id);
-        const upcoming = curIdx >= 0 ? ctx.ids.length - 1 - curIdx : 0;
-        const count = Math.min(8, room, upcoming);
-        if (count >= 2) {
-          const header = now.shuffle ? "up next ⇄" : "up next";
+        const section = (header: string) =>
           at(x, nextY, `${DIM}├─ ${header} ${"─".repeat(Math.max(0, inner - header.length - 4))}┤${RESET}`);
-          for (let i = 0; i < count; i++) {
-            const j = curIdx + 1 + i;
-            const line = clip(`${ctx.names[j]}  ${ctx.artists[j]}`, inner - 2);
-            box(nextY + 1 + i, DIM + line + RESET, line.length);
+
+        if (lyricsMode && room >= 3) {
+          section("lyrics");
+          const w = inner - 2;
+          let view: { text: string; cur: boolean }[];
+          if (!lyr || lyr.id !== now.id || lyr.loading) {
+            view = [{ text: "fetching lyrics…", cur: false }];
+          } else if (lyr.lines.length === 0) {
+            view = [{ text: "no lyrics found", cur: false }];
+          } else {
+            const synced = lyr.lines[0].t >= 0;
+            let curLine = -1;
+            if (synced) for (let i = 0; i < lyr.lines.length; i++) if (lyr.lines[i].t <= now.pos + 0.3) curLine = i;
+            const flat: { text: string; line: number }[] = [];
+            lyr.lines.forEach((ln, i) => wrapText(ln.text, w).forEach((text) => flat.push({ text, line: i })));
+            let top: number;
+            if (synced) {
+              const curRow = flat.findIndex((f) => f.line === curLine);
+              top = Math.max(0, (curRow < 0 ? 0 : curRow) - Math.floor(room / 3));
+            } else {
+              // ponytail: unsynced lyrics scroll by song progress, close enough
+              top = Math.floor((now.pos / Math.max(1, now.duration)) * Math.max(0, flat.length - room));
+            }
+            top = Math.min(top, Math.max(0, flat.length - room));
+            view = flat.slice(top, top + room).map((f) => ({ text: f.text, cur: synced && f.line === curLine }));
+          }
+          view.slice(0, room).forEach((rw, i) => {
+            const text = clip(rw.text, w);
+            box(nextY + 1 + i, rw.cur ? (accent || BOLD) + text + RESET : DIM + text + RESET, text.length);
+          });
+        } else if (!lyricsMode) {
+          // Up next: whatever rows remain, straight from the play context.
+          const curIdx = ctx.ids.indexOf(now.id);
+          const upcoming = curIdx >= 0 ? ctx.ids.length - 1 - curIdx : 0;
+          const count = Math.min(8, room, upcoming);
+          if (count >= 2) {
+            section(now.shuffle ? "up next ⇄" : "up next");
+            for (let i = 0; i < count; i++) {
+              const j = curIdx + 1 + i;
+              const line = clip(`${ctx.names[j]}  ${ctx.artists[j]}`, inner - 2);
+              box(nextY + 1 + i, DIM + line + RESET, line.length);
+            }
           }
         }
       }
@@ -653,9 +755,19 @@ async function tui() {
 
     // ---- footer
     const hints = wide
-      ? "enter play · l open · h back · / filter · ⇥ tabs · ␣ pause · ←/→ skip · +/- vol · s/r modes · q quit"
-      : "␣ pause · ←/→ skip · +/- vol · s/r modes · q quit (widen for the browser)";
+      ? "enter play · l open · h back · / filter · ⇥ tabs · y lyrics · ␣ pause · ←/→ skip · +/- vol · s/r modes · q quit"
+      : "y lyrics · ␣ pause · ←/→ skip · +/- vol · s/r modes · q quit (widen for the browser)";
     at(1, rows, `${ESC}2K` + (Date.now() < footerUntil ? " " + DIM + clip(hints, cols - 2) + RESET : ""));
+  };
+
+  // Fetch lyrics for the current track once, only while the view is open.
+  const ensureLyrics = () => {
+    if (!lyricsMode || !now.id || (lyr && lyr.id === now.id)) return;
+    const id = now.id;
+    lyr = { id, lines: [], loading: true };
+    fetchLyrics(now).then((lines) => {
+      if (lyr && lyr.id === id) { lyr = { id, lines }; draw(); }
+    });
   };
 
   const tick = () => {
@@ -665,6 +777,7 @@ async function tui() {
       ctxKey = key;
       ctx = key ? contextTracks() : { ids: [], names: [], artists: [] };
     }
+    ensureLyrics();
     draw();
   };
   // Music.app applies sets asynchronously; poll again shortly after acting
@@ -738,6 +851,7 @@ async function tui() {
       case "\t": tab = (tab + 1) % 3; drill = null; resetList(); break;
       case "1": case "2": case "3": tab = +k - 1; drill = null; resetList(); break;
       case "/": typing = true; filter = ""; cursor = 0; scroll = 0; break;
+      case "y": lyricsMode = !lyricsMode; ensureLyrics(); break;
       case "l": openSelection(); return;
       case "h": case "\x1b":
         if (drill) { drill = null; resetList(); }
@@ -792,8 +906,10 @@ options:
 
 TUI keys:
   j/k or ↑/↓ move · enter play · l open album/playlist · h back
-  tab or 1/2/3 switch tabs · / filter · esc clear
-  space pause · ←/→ prev/next · +/- volume · s shuffle · r repeat · q quit`;
+  tab or 1/2/3 switch tabs · / filter · esc clear · y lyrics
+  space pause · ←/→ prev/next · +/- volume · s shuffle · r repeat · q quit
+
+lyrics come from lrclib.net (sends title/artist/duration when the view is open)`;
 
 function songLabel(s: Song): string {
   return `${s.name}  ${DIM}${s.artist} — ${s.album}${RESET}`;

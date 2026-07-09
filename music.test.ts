@@ -12,6 +12,27 @@ test("splitKeys separates batched input, keeps escape sequences whole", () => {
   expect(splitKeys("\x1b")).toEqual(["\x1b"]); // lone esc
 });
 
+test("parseLyrics handles synced LRC, plain text, and nothing", () => {
+  const { parseLyrics } = require("./music.ts");
+  const lrc = "[00:12.34] first line\n[01:02.5]second\nnot a timestamp";
+  expect(parseLyrics(lrc, null)).toEqual([
+    { t: 12.34, text: "first line" },
+    { t: 62.5, text: "second" },
+  ]);
+  expect(parseLyrics(null, "just\ntext")).toEqual([
+    { t: -1, text: "just" },
+    { t: -1, text: "text" },
+  ]);
+  expect(parseLyrics(null, null)).toEqual([]);
+});
+
+test("wrapText wraps at word boundaries", () => {
+  const { wrapText } = require("./music.ts");
+  expect(wrapText("the quick brown fox", 10)).toEqual(["the quick", "brown fox"]);
+  expect(wrapText("", 10)).toEqual([""]);
+  expect(wrapText("short", 10)).toEqual(["short"]);
+});
+
 test("matches is case-insensitive across name/artist/album", () => {
   const t = track({ name: "Not Like Us", artist: "Kendrick Lamar", album: "GNX" });
   expect(matches(t, "kendrick")).toBe(true);
