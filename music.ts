@@ -735,7 +735,9 @@ async function tui() {
           }
           view.slice(0, roomRows).forEach((rw, i) => {
             const text = clip(rw.text, w);
-            box(r.y + 1 + i, rw.cur ? (accent || BOLD) + text + RESET : DIM + text + RESET, text.length);
+            // bold default-fg (white on dark themes): the art accent can be
+            // gray on monochrome covers and disappear into the dim lines
+            box(r.y + 1 + i, rw.cur ? BOLD + text + RESET : DIM + text + RESET, text.length);
           });
         }
       } else {
