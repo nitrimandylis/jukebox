@@ -485,8 +485,9 @@ async function tui() {
     const H = rows - 1; // panels; last row is the footer
     const wide = cols >= 72;
     const R = wide ? 38 : Math.min(cols, 48); // player panel width
-    const L = wide ? cols - R : 0; // browse panel width
-    const playerX = wide ? L + 1 : Math.max(1, Math.floor((cols - R) / 2) + 1);
+    const B = wide ? Math.min(cols - R, 56) : 0; // browse panel width, kept narrow
+    const playerX = wide ? 1 : Math.max(1, Math.floor((cols - R) / 2) + 1);
+    const browseX = R + 1; // browse sits to the right of the player
     const stopped = now.state === "stopped" || !now.id;
 
     const frame = `${now.id}|${cols}x${rows}|${stopped}`;
@@ -500,7 +501,7 @@ async function tui() {
 
     // ---- browse panel (hidden when the window is too narrow)
     if (wide) {
-      const inner = L - 2;
+      const inner = B - 2;
       const list = items();
       const visible = H - 3; // minus borders and the filter row
       cursor = Math.max(0, Math.min(cursor, list.length - 1));
@@ -512,11 +513,11 @@ async function tui() {
       let title: string;
       if (drill) {
         title = `${TABS[tab]} ▸ ${clip(drill.title, inner - TABS[tab].length - 8)}`;
-        at(1, 1, `${DIM}╭─ ${RESET}${BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+        at(browseX, 1, `${DIM}╭─ ${RESET}${BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
       } else {
         const strip = TABS.map((t, i) => (i === tab ? `${RESET}${accent || BOLD}${t}${RESET}${DIM}` : t)).join(" · ");
         title = TABS.join(" · ");
-        at(1, 1, `${DIM}╭─ ${strip} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+        at(browseX, 1, `${DIM}╭─ ${strip} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
       }
 
       for (let i = 0; i < visible; i++) {
@@ -536,15 +537,15 @@ async function tui() {
             ? `${REV} ${playing}${primary}${secondary}${pad} ${RESET}`
             : ` ${item.id && item.id === now.id ? (accent || BOLD) + playing + RESET : playing}${primary}${DIM}${secondary}${RESET}${pad} `;
         }
-        at(1, y, `${DIM}│${RESET}${content}${DIM}│${RESET}`);
+        at(browseX, y, `${DIM}│${RESET}${content}${DIM}│${RESET}`);
       }
 
       // Filter row: live input, or a hint, plus the match count.
       const count = `${list.length}`;
       const fLeft = clip(typing ? `/ ${filter}█` : filter ? `/ ${filter}` : "/ to filter", inner - count.length - 3);
       const fPad = " ".repeat(Math.max(0, inner - 2 - fLeft.length - count.length));
-      at(1, H - 1, `${DIM}│${RESET} ${typing ? RESET : DIM}${fLeft}${RESET}${fPad}${DIM}${count} │${RESET}`);
-      at(1, H, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
+      at(browseX, H - 1, `${DIM}│${RESET} ${typing ? RESET : DIM}${fLeft}${RESET}${fPad}${DIM}${count} │${RESET}`);
+      at(browseX, H, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
     }
 
     // ---- player panel
