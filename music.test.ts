@@ -33,6 +33,19 @@ test("wrapText wraps at word boundaries", () => {
   expect(wrapText("short", 10)).toEqual(["short"]);
 });
 
+test("groupArtists sorts tracks by album/disc/track, artists newest-first", () => {
+  const { groupArtists } = require("./music.ts");
+  const artists = groupArtists([
+    track({ id: "b2", artist: "Old Guy", album: "B", track: 2, added: 10 }),
+    track({ id: "b1", artist: "Old Guy", album: "B", track: 1, added: 5 }),
+    track({ id: "a1", artist: "Old Guy", album: "A", track: 9, added: 1 }),
+    track({ id: "n1", artist: "New Guy", added: 999 }),
+    track({ id: "x", artist: "" }), // no artist — dropped
+  ]);
+  expect(artists.map((a: any) => a.name)).toEqual(["New Guy", "Old Guy"]);
+  expect(artists[1].tracks.map((t: any) => t.id)).toEqual(["a1", "b1", "b2"]);
+});
+
 test("matches is case-insensitive across name/artist/album", () => {
   const t = track({ name: "Not Like Us", artist: "Kendrick Lamar", album: "GNX" });
   expect(matches(t, "kendrick")).toBe(true);

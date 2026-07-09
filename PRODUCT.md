@@ -12,13 +12,15 @@ register: product (a tool — design serves the product)
 - **The TUI is the main way in**: bare `music` opens a three-panel app,
   lazygit-style, in equal-width columns (stacking vertically on narrow
   terminals). Left: the now-playing panel — album art as real pixels (Kitty
-  graphics), progress bar tinted with the cover's dominant color. Middle:
-  a preview panel showing the track list behind the browse cursor (hover an
-  album/playlist to see inside before committing), or lyrics — ⇥ switches.
-  Right: the browser with songs / albums / playlists tabs (1/2/3) — the
-  whole library is bulk-fetched once at startup (~0.2s for ~1700 tracks) and
-  filtered locally with `/`, newest additions first. Enter plays; `l` drills
-  into an album/playlist and enter inside plays it from that track.
+  graphics), progress bar tinted with the cover's dominant color. Middle
+  (⇥ cycles): a preview panel showing the track list behind the browse
+  cursor, lyrics, or the queue — the queue view has its own cursor (j/k,
+  enter plays, x removes, J/K reorder). Right: the browser with
+  songs / albums / playlists / artists tabs (1/2/3/4) — the whole library is
+  bulk-fetched once at startup (~0.2s for ~1700 tracks) and filtered locally
+  with `/`, newest additions first. Enter plays; `l` drills into an
+  album/playlist/artist and enter inside plays it from that track; `a` adds
+  the hovered thing to the queue.
   The player also shows a dim details line (genre · year · plays · ♥) and an
   "up next" section fed by the current play context, refreshed only when the
   context changes. `y` swaps that section for lyrics (lrclib.net, keyless,
@@ -28,8 +30,10 @@ register: product (a tool — design serves the product)
   space pause, ←/→ skip, +/- volume, s/r modes.
 - **Quick commands are the extras**: `music play <query>` (fzf-pick a song),
   `music queue <query>` (fzf multi-select songs to play next; bare `queue`
-  shows what's coming), `music album` / `music playlist` (pick and play
-  whole), `music pause|next|prev`, `music shuffle|repeat`, `music search`.
+  shows what's coming), `music album` / `music artist` / `music playlist`
+  (pick and play whole), `music pause|next|prev`, `music shuffle|repeat`,
+  `music search`.
+- Artwork and lyrics cache to `~/.cache/music-cli` (persists across reboots).
 
 ## Design stance
 
@@ -46,9 +50,3 @@ codes. The album art is the only full-color element on screen.
   playing from another context jumps into the scratch playlist at the same
   position — near-seamless, but the old context's upcoming tracks are left
   behind, and shuffle-on ignores queue order.
-
-## Where it's headed (maybe)
-
-- Artist as a first-class play target.
-- `music love` / `music add <playlist>` for triaging new music.
-- Catalog search if a MusicKit token ever materializes.

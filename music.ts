@@ -11,6 +11,7 @@
 //        music queue [query]        pick songs to play next (no query: show queue)
 //        music play -q <query>      same as music queue
 //        music album <query>        pick an album, play it in order
+//        music artist <query>       pick an artist, play everything by them
 //        music playlist <query>     pick a playlist, play it
 //        music search <query>       list matches without playing
 //        music pause | next | prev  transport
@@ -21,9 +22,9 @@
 //           ␣ pause · ←/→ prev/next · +/- volume · s/r shuffle/repeat · q quit
 
 import { existsSync, mkdirSync, readFileSync } from "fs";
-import { tmpdir } from "os";
+import { homedir } from "os";
 
-const CACHE = `${tmpdir()}/music-cli`; // per-track artwork cache
+const CACHE = `${homedir()}/.cache/music-cli`; // per-track artwork + lyrics cache
 const TEMP_PLAYLIST = "music-cli"; // scratch playlist for album playback
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,21 @@ function jxa(body: string): any {
   const script = `(function () { const music = Application("Music"); ${body} })()`;
   const out = osascript(["-l", "JavaScript", "-e", script]);
   return out ? JSON.parse(out) : null;
+}
+
+// Like jxa, but retries: Music.app throws transient errors (-1708) when a
+// playlist rebuild lands while it's still settling from the previous one.
+function jxaRetry(body: string, attempts = 3): any {
+  const script = `(function () { const music = Application("Music"); ${body} })()`;
+  for (let i = 1; i < attempts; i++) {
+    const res = Bun.spawnSync(["osascript", "-l", "JavaScript", "-e", script], { stderr: "pipe" });
+    if (res.exitCode === 0) {
+      const out = res.stdout.toString().trim();
+      return out ? JSON.parse(out) : null;
+    }
+    Bun.sleepSync(400);
+  }
+  return jxa(body); // last attempt reports the error for real
 }
 
 export type Track = {
@@ -118,18 +134,22 @@ function searchLibrary(query: string): Song[] {
 function playTracksAsPlaylist(ids: string[], startId?: string) {
   const start = startId ? Math.max(0, ids.indexOf(startId)) : 0;
   const list = ids.slice(start);
-  jxa(`
+  jxaRetry(`
     const lib = music.libraryPlaylists[0];
-    const allIds = lib.tracks.persistentID(); // one bulk fetch beats a whose() scan per track
+    // Two aligned bulk fetches, then byId() key lookups. NEVER index
+    // lib.tracks[i] against a bulk array — the orders don't match.
+    const pids = lib.tracks.persistentID();
+    const dbids = lib.tracks.id();
     const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
     while (old.length > 0) music.delete(old[0]);
     const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
     for (const id of ${JSON.stringify(list)}) {
-      const i = allIds.indexOf(id);
+      const i = pids.indexOf(id);
       if (i < 0) continue; // dead track
-      try { music.duplicate(lib.tracks[i], { to: pl }); } catch (e) {}
+      try { music.duplicate(lib.tracks.byId(dbids[i]), { to: pl }); } catch (e) {}
     }
-    pl.play();
+    // already mutated: never throw past this point (see queueTracks)
+    try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} }
     return "";
   `);
 }
@@ -139,11 +159,16 @@ function playTracksAsPlaylist(ids: string[], startId?: string) {
 // else: rebuild it as [current track, ...queued], jump in, and restore the
 // playback position — near-seamless, but the old context's upcoming tracks
 // are left behind (the one thing Music.app can't hide).
-function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
-  return jxa(`
+// replace=true swaps the entire upcoming list for `ids` (queue editing);
+// replace=false appends `ids` after whatever is already upcoming.
+function queueTracks(ids: string[], replace = false): { mode: string; shuffle: boolean } {
+  return jxaRetry(`
     const lib = music.libraryPlaylists[0];
-    const allIds = lib.tracks.persistentID(); // one bulk fetch beats a whose() scan per track
-    const byId = (id) => { const i = allIds.indexOf(id); return i >= 0 ? lib.tracks[i] : null; };
+    // Two aligned bulk fetches, then byId() key lookups. NEVER index
+    // lib.tracks[i] against a bulk array — the orders don't match.
+    const pids = lib.tracks.persistentID();
+    const dbids = lib.tracks.id();
+    const byId = (id) => { const i = pids.indexOf(id); return i >= 0 ? lib.tracks.byId(dbids[i]) : null; };
     const state = music.playerState();
     const active = state === "playing" || state === "paused";
     let currentId = "", pos = 0, inQueue = false;
@@ -152,13 +177,21 @@ function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
       pos = music.playerPosition() || 0;
       inQueue = music.currentPlaylist.name() === ${JSON.stringify(TEMP_PLAYLIST)};
     } catch (e) {}
-    const shuffle = music.shuffleEnabled();
+    // currentPlaylist reads stale for ~1s after a rebuild; if the scratch
+    // playlist holds the current track, we are in the queue regardless.
+    if (!inQueue && active && currentId) {
+      try {
+        inQueue = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)}).tracks.persistentID().indexOf(currentId) >= 0;
+      } catch (e) {}
+    }
+    let shuffle = false;
+    try { shuffle = music.shuffleEnabled(); } catch (e) {}
     // Music snapshots a playlist when play() starts — appending to it later
     // does nothing to the running queue. So every queue op rebuilds the
     // playlist as [current, leftover upcoming, new songs] and re-enters it,
     // restoring the playback position.
     let leftover = [];
-    if (active && inQueue) {
+    if (active && inQueue && !${JSON.stringify(replace)}) {
       try {
         const before = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)}).tracks.persistentID();
         const idx = before.indexOf(currentId);
@@ -170,23 +203,28 @@ function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
     const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
     const all = active && currentId ? [currentId, ...leftover, ...${JSON.stringify(ids)}] : ${JSON.stringify(ids)};
     for (const id of all) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
+    // Everything below has already mutated the playlist, so it must never
+    // throw — a script error here would make the caller's retry duplicate
+    // the rebuild. Each step is best-effort.
     if (active && currentId) {
       // pl.play() restarts the current song from 0:00 before the seek lands,
       // which is audible. Mute for the jump, then keep re-seeking until the
       // position actually sticks and unmute the instant it does.
-      const vol = music.soundVolume();
-      music.soundVolume = 0;
-      pl.play(); // the only call that makes Music adopt the playlist as its context
-      for (let i = 0; i < 20; i++) {
-        music.playerPosition = pos;
-        if (Math.abs((music.playerPosition() || 0) - pos) < 1.5) break;
-        delay(0.05);
-      }
-      if (state === "paused") music.playpause();
-      music.soundVolume = vol;
+      let vol = 100;
+      try { vol = music.soundVolume(); music.soundVolume = 0; } catch (e) {}
+      try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} } // the only call that adopts the playlist as context
+      try {
+        for (let i = 0; i < 20; i++) {
+          music.playerPosition = pos;
+          if (Math.abs((music.playerPosition() || 0) - pos) < 1.5) break;
+          delay(0.05);
+        }
+      } catch (e) {}
+      try { if (state === "paused") music.playpause(); } catch (e) {}
+      try { music.soundVolume = vol; } catch (e) {}
       return JSON.stringify({ mode: "switched", shuffle });
     }
-    pl.play();
+    try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} }
     return JSON.stringify({ mode: "started", shuffle });
   `);
 }
@@ -234,6 +272,27 @@ function playAlbum(album: string) {
 
 function playPlaylist(name: string) {
   jxa(`music.playlists.byName(${JSON.stringify(name)}).play(); return "";`);
+}
+
+// Command-line artist play: everything by the artist, album by album.
+function playArtist(name: string) {
+  jxa(`
+    const lib = music.libraryPlaylists[0];
+    const spec = lib.tracks.whose({ artist: ${JSON.stringify(name)} });
+    let albums = [], discs = [], nums = [];
+    try { albums = spec.album(); discs = spec.discNumber(); nums = spec.trackNumber(); }
+    catch (e) { albums = new Array(spec.length).fill(""); discs = albums; nums = albums; } // dead reference: keep library order
+    const order = albums.map((a, i) => i);
+    order.sort((a, b) => String(albums[a]).localeCompare(String(albums[b])) || (discs[a] - discs[b]) || (nums[a] - nums[b]));
+    const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
+    while (old.length > 0) music.delete(old[0]);
+    const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
+    for (const i of order) {
+      try { music.duplicate(spec[i], { to: pl }); } catch (e) {} // skip dead tracks
+    }
+    pl.play();
+    return "";
+  `);
 }
 
 type Now = {
@@ -441,6 +500,28 @@ export function matches(t: { name: string; artist: string; album: string }, quer
 }
 
 export type AlbumEntry = { name: string; artist: string; added: number; tracks: Track[] };
+export type ArtistEntry = { name: string; added: number; tracks: Track[] };
+
+// Group the library by artist: tracks in album/disc/track order, newest first.
+export function groupArtists(tracks: Track[]): ArtistEntry[] {
+  const byName = new Map<string, ArtistEntry>();
+  for (const t of tracks) {
+    if (!t.artist) continue;
+    let entry = byName.get(t.artist);
+    if (!entry) {
+      entry = { name: t.artist, added: 0, tracks: [] };
+      byName.set(t.artist, entry);
+    }
+    entry.tracks.push(t);
+    entry.added = Math.max(entry.added, t.added);
+  }
+  const artists = [...byName.values()];
+  for (const a of artists) {
+    a.tracks.sort((x, y) => x.album.localeCompare(y.album) || (x.disc - y.disc) || (x.track - y.track));
+  }
+  artists.sort((a, b) => b.added - a.added);
+  return artists;
+}
 
 // Group the library into albums: tracks in disc/track order, albums newest first.
 export function groupAlbums(tracks: Track[]): AlbumEntry[] {
@@ -510,7 +591,7 @@ const BOLD = `${ESC}1m`, DIM = `${ESC}2m`, REV = `${ESC}7m`, RESET = `${ESC}0m`;
 
 const clip = (s: string, max: number) => (s.length > max ? s.slice(0, Math.max(0, max - 1)) + "…" : s);
 
-const TABS = ["songs", "albums", "playlists"] as const;
+const TABS = ["songs", "albums", "playlists", "artists"] as const;
 
 async function tui() {
   if (!process.stdout.isTTY) {
@@ -521,6 +602,7 @@ async function tui() {
   // Everything the browser shows comes from this one startup snapshot.
   const library = loadLibrary().sort((a, b) => b.added - a.added);
   const albums = groupAlbums(library);
+  const artists = groupArtists(library);
   const playlistNames = loadPlaylistNames();
   const playlistCache = new Map<string, Track[]>();
 
@@ -532,14 +614,15 @@ async function tui() {
   let tab = 0;
   let cursor = 0, scroll = 0;
   let filter = "", typing = false;
-  let drill: { kind: "album" | "playlist"; title: string; tracks: Track[] } | null = null;
+  let drill: { kind: "album" | "playlist" | "artist"; title: string; tracks: Track[] } | null = null;
   let now: Now = nowPlaying();
   let lastFrame = ""; // art + border cache key
   let accent = "";
   let flashKey = "", flashUntil = 0; // status item to show briefly after its key
   let ctx: { ids: string[]; names: string[]; artists: string[] } = { ids: [], names: [], artists: [] };
   let ctxKey = ""; // play-context cache: refetch only when the context changes
-  let middleMode: "preview" | "lyrics" = "preview"; // what the middle panel shows
+  let middleMode: "preview" | "lyrics" | "queue" = "preview"; // what the middle panel shows
+  let qCursor = 0; // selection inside the queue view
   let lyr: { id: string; lines: LyricLine[]; loading?: boolean } | null = null;
   let previewFetch: ReturnType<typeof setTimeout> | null = null;
 
@@ -568,6 +651,11 @@ async function tui() {
         .filter((a) => !filter || matches({ name: a.name, artist: a.artist, album: "" }, filter))
         .map((a) => ({ primary: a.name, secondary: a.artist, id: "" }));
     }
+    if (tab === 3) {
+      return artists
+        .filter((a) => !filter || a.name.toLowerCase().includes(filter.toLowerCase()))
+        .map((a) => ({ primary: a.name, secondary: `${a.tracks.length} songs`, id: "" }));
+    }
     return playlistNames
       .filter((n) => !filter || n.toLowerCase().includes(filter.toLowerCase()))
       .map((n) => ({ primary: n, secondary: "", id: "" }));
@@ -593,6 +681,10 @@ async function tui() {
     }
     if (tab === 1) {
       const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
+      return a ? { title: a.name, tracks: a.tracks, markId: "" } : null;
+    }
+    if (tab === 3) {
+      const a = selected(artists, (x) => !filter || x.name.toLowerCase().includes(filter.toLowerCase()));
       return a ? { title: a.name, tracks: a.tracks, markId: "" } : null;
     }
     const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
@@ -685,10 +777,14 @@ async function tui() {
       if (drill) {
         title = `${TABS[tab]} ▸ ${clip(drill.title, inner - TABS[tab].length - 8)}`;
         at(browseX, r.y, `${DIM}╭─ ${RESET}${BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
-      } else {
+      } else if (TABS.join(" · ").length <= inner - 4) {
         const strip = TABS.map((t, i) => (i === tab ? `${RESET}${accent || BOLD}${t}${RESET}${DIM}` : t)).join(" · ");
         title = TABS.join(" · ");
         at(browseX, r.y, `${DIM}╭─ ${strip} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+      } else {
+        // narrow panel: full tab strip won't fit, show just the active tab
+        title = `${tab + 1}/${TABS.length} ${TABS[tab]}`;
+        at(browseX, r.y, `${DIM}╭─ ${RESET}${accent || BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
       }
 
       for (let i = 0; i < visible; i++) {
@@ -719,10 +815,35 @@ async function tui() {
       at(browseX, r.y + r.h - 1, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
     }
 
-    // ---- middle panel: preview of the hovered item, or lyrics (⇥ switches)
+    // ---- middle panel: preview of the hovered item, lyrics, or the queue (⇥ cycles)
     if (middle) {
       const r = middle, inner = r.w - 2, w = inner - 2, roomRows = r.h - 2;
-      if (middleMode === "lyrics") {
+      if (middleMode === "queue") {
+        const up = upcoming();
+        const box = panel(r, `queue · ${up.length}`);
+        if (up.length === 0) {
+          const msg = "queue is empty — a adds the hovered song";
+          box(r.y + Math.floor(r.h / 2), DIM + clip(msg, w) + RESET, Math.min(msg.length, w));
+        } else {
+          qCursor = Math.max(0, Math.min(qCursor, up.length - 1));
+          let top = Math.max(0, qCursor - Math.floor(roomRows / 2));
+          top = Math.min(top, Math.max(0, up.length - roomRows));
+          for (let i = 0; i < Math.min(roomRows, up.length - top); i++) {
+            const t = up[top + i];
+            const isCur = top + i === qCursor;
+            const num = String(top + i + 1).padStart(2);
+            const nm = clip(t.name, w - 4);
+            const room2 = w - 4 - nm.length;
+            const art2 = t.artist && room2 > 4 ? "  " + clip(t.artist, room2 - 2) : "";
+            if (isCur) {
+              const pad = " ".repeat(Math.max(0, w - num.length - 1 - nm.length - art2.length));
+              box(r.y + 1 + i, `${REV}${num} ${nm}${art2}${pad}${RESET}`, w);
+            } else {
+              box(r.y + 1 + i, `${DIM}${num}${RESET} ${nm}${DIM}${art2}${RESET}`, num.length + 1 + nm.length + art2.length);
+            }
+          }
+        }
+      } else if (middleMode === "lyrics") {
         const box = panel(r, "lyrics");
         if (stopped) {
           const msg = "nothing playing";
@@ -865,7 +986,9 @@ async function tui() {
     }
 
     // ---- footer
-    const hints = "enter play · a queue · l open · h back · / filter · 1/2/3 tabs · ⇥ lyrics · ␣ pause · ←/→ skip · +/- vol · s/r · q quit";
+    const hints = middleMode === "queue"
+      ? "j/k select · enter play · x remove · J/K reorder · a add hovered · ⇥ panel · ␣ pause · q quit"
+      : "enter play · a queue · l open · h back · / filter · 1-4 tabs · ⇥ panel · ␣ pause · ←/→ skip · +/- vol · s/r · q quit";
     at(1, rows, `${ESC}2K ` + DIM + clip(hints, cols - 2) + RESET);
   };
 
@@ -908,6 +1031,10 @@ async function tui() {
       const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
       if (!a) return;
       drill = { kind: "album", title: a.name, tracks: a.tracks };
+    } else if (tab === 3) {
+      const a = selected(artists, (x) => !filter || x.name.toLowerCase().includes(filter.toLowerCase()));
+      if (!a) return;
+      drill = { kind: "artist", title: a.name, tracks: a.tracks };
     } else {
       const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
       if (!name) return;
@@ -931,12 +1058,63 @@ async function tui() {
     } else if (tab === 1) {
       const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
       if (a) playTracksAsPlaylist(a.tracks.map((x) => x.id));
+    } else if (tab === 3) {
+      const a = selected(artists, (x) => !filter || x.name.toLowerCase().includes(filter.toLowerCase()));
+      if (a) playTracksAsPlaylist(a.tracks.map((x) => x.id));
     } else {
       const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
       if (name) playPlaylist(name);
     }
     tick();
     setTimeout(tick, 600); // give Music.app a beat, then show the new track
+  };
+
+  // What's coming after the current track in the play context — the queue.
+  const upcoming = (): { id: string; name: string; artist: string }[] => {
+    const curIdx = ctx.ids.indexOf(now.id);
+    if (curIdx < 0) return [];
+    return ctx.ids.slice(curIdx + 1).map((id, i) => ({
+      id, name: ctx.names[curIdx + 1 + i] || "", artist: ctx.artists[curIdx + 1 + i] || "",
+    }));
+  };
+
+  // Queue edits: any change means a rebuild + re-entry (Music snapshots the
+  // playlist on play), so each op writes the new upcoming list wholesale.
+  // Reorders keep the same track count, so the plName|plCount cache key
+  // won't notice them — force the context refetch after every edit.
+  const queueRefresh = () => {
+    ctxKey = "";
+    tick();
+    setTimeout(() => { ctxKey = ""; tick(); }, 600);
+  };
+
+  const queueRemove = () => {
+    const up = upcoming();
+    if (up.length === 0) return;
+    up.splice(Math.min(qCursor, up.length - 1), 1);
+    queueTracks(up.map((u) => u.id), true);
+    queueRefresh();
+  };
+
+  const queueMove = (d: number) => {
+    const up = upcoming();
+    if (up.length === 0) return;
+    const i = Math.min(qCursor, up.length - 1);
+    const j = i + d;
+    if (j < 0 || j >= up.length) return;
+    [up[i], up[j]] = [up[j], up[i]];
+    queueTracks(up.map((u) => u.id), true);
+    qCursor = j;
+    queueRefresh();
+  };
+
+  const queueJump = () => {
+    const up = upcoming();
+    if (up.length === 0) return;
+    const i = Math.min(qCursor, up.length - 1);
+    playTracksAsPlaylist(up.map((u) => u.id), up[i].id);
+    qCursor = 0;
+    queueRefresh();
   };
 
   // `a`: add the hovered thing to the queue (song, or whole album/playlist).
@@ -950,6 +1128,9 @@ async function tui() {
       if (t) ids = [t.id];
     } else if (tab === 1) {
       const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
+      if (a) ids = a.tracks.map((t) => t.id);
+    } else if (tab === 3) {
+      const a = selected(artists, (x) => !filter || x.name.toLowerCase().includes(filter.toLowerCase()));
       if (a) ids = a.tracks.map((t) => t.id);
     } else {
       const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
@@ -980,13 +1161,29 @@ async function tui() {
       return;
     }
 
+    // In queue mode, list keys drive the queue view; everything else falls
+    // through to the shared bindings below.
+    if (middleMode === "queue") {
+      switch (k) {
+        case "j": case `${ESC}B`: qCursor++; draw(); return;
+        case "k": case `${ESC}A`: qCursor--; draw(); return;
+        case "x": queueRemove(); return;
+        case "J": queueMove(1); return;
+        case "K": queueMove(-1); return;
+        case "\r": queueJump(); return;
+      }
+    }
+
     switch (k) {
       case "j": case `${ESC}B`: cursor++; break;
       case "k": case `${ESC}A`: cursor--; break;
       case "g": cursor = 0; break;
       case "G": cursor = Infinity; break;
-      case "\t": middleMode = middleMode === "preview" ? "lyrics" : "preview"; ensureLyrics(); break;
-      case "1": case "2": case "3": tab = +k - 1; drill = null; resetList(); break;
+      case "\t":
+        middleMode = middleMode === "preview" ? "lyrics" : middleMode === "lyrics" ? "queue" : "preview";
+        ensureLyrics();
+        break;
+      case "1": case "2": case "3": case "4": tab = +k - 1; drill = null; resetList(); break;
       case "/": typing = true; filter = ""; cursor = 0; scroll = 0; break;
       case "l": openSelection(); return;
       case "h": case "\x1b":
@@ -1031,6 +1228,7 @@ commands:
   queue [query]     pick songs to play next (no query: show the queue)
   play -q <query>   same as queue
   album <query>     pick an album, play it in order
+  artist <query>    pick an artist, play everything by them
   playlist <query>  pick a playlist, play it
   search <query>    list matching songs without playing
   pause             toggle play/pause
@@ -1043,7 +1241,8 @@ options:
 
 TUI keys:
   j/k or ↑/↓ move · enter play · l open album/playlist · h back
-  a add to queue · 1/2/3 switch tabs · tab preview/lyrics panel
+  a add to queue · 1/2/3/4 switch tabs · tab cycles preview/lyrics/queue
+  queue view: j/k select · enter play · x remove · J/K reorder
   / filter · esc clear · space pause · ←/→ prev/next · +/- volume
   s shuffle · r repeat · q quit
 
@@ -1099,6 +1298,18 @@ function main() {
       if (i === null) return;
       playAlbum(albums[i]);
       console.log(`▶ ${albums[i]}`);
+      break;
+    }
+    case "artist": {
+      requireQuery(query, "usage: music artist <query>");
+      const q = query.toLowerCase();
+      const names = [...new Set(searchLibrary(query).map((s) => s.artist))]
+        .filter((a) => a.toLowerCase().includes(q));
+      if (names.length === 0) { console.error(`no artist matches "${query}"`); process.exit(1); }
+      const i = pick(names, "artist");
+      if (i === null) return;
+      playArtist(names[i]);
+      console.log(`▶ ${names[i]}`);
       break;
     }
     case "playlist": {
