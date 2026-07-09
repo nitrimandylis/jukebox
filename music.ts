@@ -17,8 +17,8 @@
 //        music shuffle | repeat     toggle / cycle
 //
 // TUI keys: j/k move · 1/2/3 switch tabs · ⇥ preview/lyrics · / filter
-//           enter play · l open album/playlist · h back · ␣ pause
-//           ←/→ prev/next track · +/- volume · s/r shuffle/repeat · q quit
+//           enter play · a add to queue · l open album/playlist · h back
+//           ␣ pause · ←/→ prev/next · +/- volume · s/r shuffle/repeat · q quit
 
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
@@ -118,20 +118,22 @@ function playSongById(id: string): boolean {
 }
 
 // Music.app has no scriptable "play these tracks": the reliable trick is a
-// throwaway playlist. Rebuild it with the given tracks and play — from the
-// start, or from startId when set.
+// throwaway playlist. Playing an individual track object NEVER adopts the
+// playlist as the play context (verified: context stays wherever it was), so
+// the only reliable move is pl.play() — to start mid-list, build the
+// playlist from that track onward.
 function playTracksAsPlaylist(ids: string[], startId?: string) {
+  const start = startId ? Math.max(0, ids.indexOf(startId)) : 0;
+  const list = ids.slice(start);
   jxa(`
     const lib = music.libraryPlaylists[0];
     const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
     while (old.length > 0) music.delete(old[0]);
     const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
-    for (const id of ${JSON.stringify(ids)}) {
+    for (const id of ${JSON.stringify(list)}) {
       try { music.duplicate(lib.tracks.whose({ persistentID: id })[0], { to: pl }); } catch (e) {} // skip dead tracks
     }
-    ${startId
-      ? `try { pl.tracks.whose({ persistentID: ${JSON.stringify(startId)} })[0].play(); } catch (e) { pl.play(); }`
-      : `pl.play();`}
+    pl.play();
     return "";
   `);
 }
@@ -165,7 +167,7 @@ function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
     const all = active && currentId ? [currentId, ...${JSON.stringify(ids)}] : ${JSON.stringify(ids)};
     for (const id of all) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
     if (active && currentId) {
-      pl.tracks[0].play();
+      pl.play(); // first track is the current one; play() is the only call that adopts the context
       music.playerPosition = pos;
       if (state === "paused") music.playpause();
       return JSON.stringify({ mode: "switched", shuffle });
@@ -216,14 +218,8 @@ function playAlbum(album: string) {
   `);
 }
 
-function playPlaylist(name: string, startId?: string) {
-  jxa(`
-    const pl = music.playlists.byName(${JSON.stringify(name)});
-    ${startId
-      ? `try { pl.tracks.whose({ persistentID: ${JSON.stringify(startId)} })[0].play(); } catch (e) { pl.play(); }`
-      : `pl.play();`}
-    return "";
-  `);
+function playPlaylist(name: string) {
+  jxa(`music.playlists.byName(${JSON.stringify(name)}).play(); return "";`);
 }
 
 type Now = {
@@ -512,6 +508,9 @@ async function tui() {
   const albums = groupAlbums(library);
   const playlistNames = loadPlaylistNames();
   const playlistCache = new Map<string, Track[]>();
+  // Playing a single song puts Music in the library-wide "context", but it
+  // never actually continues through it — so that context is not a queue.
+  const libraryName: string = jxa(`return JSON.stringify(music.libraryPlaylists[0].name());`);
 
   process.stdout.write(`${ESC}?1049h${ESC}?25l${ESC}2J`); // alt screen, hide cursor
   process.stdin.setRawMode(true);
@@ -846,7 +845,7 @@ async function tui() {
     }
 
     // ---- footer
-    const hints = "enter play · l open · h back · / filter · 1/2/3 tabs · ⇥ preview/lyrics · ␣ pause · ←/→ skip · +/- vol · s/r modes · q quit";
+    const hints = "enter play · a queue · l open · h back · / filter · 1/2/3 tabs · ⇥ lyrics · ␣ pause · ←/→ skip · +/- vol · s/r · q quit";
     at(1, rows, `${ESC}2K ` + DIM + clip(hints, cols - 2) + RESET);
   };
 
@@ -862,7 +861,7 @@ async function tui() {
 
   const tick = () => {
     now = nowPlaying();
-    const key = now.plName ? `${now.plName}|${now.plCount}` : "";
+    const key = now.plName && now.plName !== libraryName ? `${now.plName}|${now.plCount}` : "";
     if (key !== ctxKey) {
       ctxKey = key;
       ctx = key ? contextTracks() : { ids: [], names: [], artists: [] };
@@ -900,8 +899,9 @@ async function tui() {
     if (drill) {
       const t = selected(drill.tracks, (x) => !filter || matches(x, filter));
       if (!t) return;
-      if (drill.kind === "album") playTracksAsPlaylist(drill.tracks.map((x) => x.id), t.id);
-      else playPlaylist(drill.title, t.id);
+      // both go through the scratch playlist: starting a real playlist mid-way
+      // is only possible by rebuilding it from that track (see playTracksAsPlaylist)
+      playTracksAsPlaylist(drill.tracks.map((x) => x.id), t.id);
     } else if (tab === 0) {
       const t = selected(library, (x) => !filter || matches(x, filter));
       if (t) playSongById(t.id);
@@ -914,6 +914,31 @@ async function tui() {
     }
     tick();
     setTimeout(tick, 600); // give Music.app a beat, then show the new track
+  };
+
+  // `a`: add the hovered thing to the queue (song, or whole album/playlist).
+  const queueSelection = () => {
+    let ids: string[] = [];
+    if (drill) {
+      const t = selected(drill.tracks, (x) => !filter || matches(x, filter));
+      if (t) ids = [t.id];
+    } else if (tab === 0) {
+      const t = selected(library, (x) => !filter || matches(x, filter));
+      if (t) ids = [t.id];
+    } else if (tab === 1) {
+      const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
+      if (a) ids = a.tracks.map((t) => t.id);
+    } else {
+      const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
+      if (name) {
+        if (!playlistCache.has(name)) playlistCache.set(name, loadPlaylistTracks(name));
+        ids = playlistCache.get(name)!.map((t) => t.id);
+      }
+    }
+    if (ids.length === 0) return;
+    queueTracks(ids);
+    tick();
+    setTimeout(tick, 600); // let Music settle, then show the new queue
   };
 
   process.stdin.on("data", (chunk: Buffer) => {
@@ -946,6 +971,7 @@ async function tui() {
         else if (filter) { filter = ""; cursor = 0; scroll = 0; }
         break;
       case "\r": playSelection(); return;
+      case "a": queueSelection(); return;
       case " ": act("music.playpause()"); return;
       case `${ESC}C`: act("music.nextTrack()"); return;
       case `${ESC}D`: act("music.backTrack()"); return;
@@ -994,8 +1020,9 @@ options:
 
 TUI keys:
   j/k or ↑/↓ move · enter play · l open album/playlist · h back
-  1/2/3 switch tabs · tab preview/lyrics panel · / filter · esc clear
-  space pause · ←/→ prev/next · +/- volume · s shuffle · r repeat · q quit
+  a add to queue · 1/2/3 switch tabs · tab preview/lyrics panel
+  / filter · esc clear · space pause · ←/→ prev/next · +/- volume
+  s shuffle · r repeat · q quit
 
 lyrics come from lrclib.net (sends title/artist/duration when the view is open)`;
 
