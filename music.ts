@@ -120,11 +120,14 @@ function playTracksAsPlaylist(ids: string[], startId?: string) {
   const list = ids.slice(start);
   jxa(`
     const lib = music.libraryPlaylists[0];
+    const allIds = lib.tracks.persistentID(); // one bulk fetch beats a whose() scan per track
     const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
     while (old.length > 0) music.delete(old[0]);
     const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
     for (const id of ${JSON.stringify(list)}) {
-      try { music.duplicate(lib.tracks.whose({ persistentID: id })[0], { to: pl }); } catch (e) {} // skip dead tracks
+      const i = allIds.indexOf(id);
+      if (i < 0) continue; // dead track
+      try { music.duplicate(lib.tracks[i], { to: pl }); } catch (e) {}
     }
     pl.play();
     return "";
@@ -139,7 +142,8 @@ function playTracksAsPlaylist(ids: string[], startId?: string) {
 function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
   return jxa(`
     const lib = music.libraryPlaylists[0];
-    const byId = (id) => { const f = lib.tracks.whose({ persistentID: id }); return f.length ? f[0] : null; };
+    const allIds = lib.tracks.persistentID(); // one bulk fetch beats a whose() scan per track
+    const byId = (id) => { const i = allIds.indexOf(id); return i >= 0 ? lib.tracks[i] : null; };
     const state = music.playerState();
     const active = state === "playing" || state === "paused";
     let currentId = "", pos = 0, inQueue = false;
@@ -168,15 +172,16 @@ function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
     for (const id of all) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
     if (active && currentId) {
       // pl.play() restarts the current song from 0:00 before the seek lands,
-      // which is audible. Mute for the jump and seek twice — once right away,
-      // once after the track has actually loaded — so it reads as a short
-      // silence instead of a restart.
+      // which is audible. Mute for the jump, then keep re-seeking until the
+      // position actually sticks and unmute the instant it does.
       const vol = music.soundVolume();
       music.soundVolume = 0;
       pl.play(); // the only call that makes Music adopt the playlist as its context
-      music.playerPosition = pos;
-      delay(0.3);
-      music.playerPosition = pos;
+      for (let i = 0; i < 20; i++) {
+        music.playerPosition = pos;
+        if (Math.abs((music.playerPosition() || 0) - pos) < 1.5) break;
+        delay(0.05);
+      }
       if (state === "paused") music.playpause();
       music.soundVolume = vol;
       return JSON.stringify({ mode: "switched", shuffle });
