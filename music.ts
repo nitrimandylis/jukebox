@@ -156,18 +156,25 @@ function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
       inQueue = music.currentPlaylist.name() === ${JSON.stringify(TEMP_PLAYLIST)};
     } catch (e) {}
     const shuffle = music.shuffleEnabled();
+    // Music snapshots a playlist when play() starts — appending to it later
+    // does nothing to the running queue. So every queue op rebuilds the
+    // playlist as [current, leftover upcoming, new songs] and re-enters it,
+    // restoring the playback position.
+    let leftover = [];
     if (active && inQueue) {
-      const pl = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)});
-      for (const id of ${JSON.stringify(ids)}) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
-      return JSON.stringify({ mode: "appended", shuffle });
+      try {
+        const before = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)}).tracks.persistentID();
+        const idx = before.indexOf(currentId);
+        if (idx >= 0) leftover = before.slice(idx + 1);
+      } catch (e) {}
     }
     const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
     while (old.length > 0) music.delete(old[0]);
     const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
-    const all = active && currentId ? [currentId, ...${JSON.stringify(ids)}] : ${JSON.stringify(ids)};
+    const all = active && currentId ? [currentId, ...leftover, ...${JSON.stringify(ids)}] : ${JSON.stringify(ids)};
     for (const id of all) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
     if (active && currentId) {
-      pl.play(); // first track is the current one; play() is the only call that adopts the context
+      pl.play(); // the only call that makes Music adopt the playlist as its context
       music.playerPosition = pos;
       if (state === "paused") music.playpause();
       return JSON.stringify({ mode: "switched", shuffle });
@@ -226,7 +233,7 @@ type Now = {
   state: string; vol: number; shuffle: boolean; repeat: string;
   id: string; name: string; artist: string; album: string; duration: number; pos: number;
   genre: string; year: number; plays: number; fav: boolean;
-  plName: string; plCount: number; // current play context, for "up next"
+  plName: string; plCount: number; plSpecial: string; // current play context, for "up next"
 };
 
 function nowPlaying(): Now {
@@ -234,7 +241,7 @@ function nowPlaying(): Now {
     const out = { state: music.playerState(), vol: music.soundVolume(),
       shuffle: music.shuffleEnabled(), repeat: music.songRepeat(),
       id: "", name: "", artist: "", album: "", duration: 0, pos: 0,
-      genre: "", year: 0, plays: 0, fav: false, plName: "", plCount: 0 };
+      genre: "", year: 0, plays: 0, fav: false, plName: "", plCount: 0, plSpecial: "" };
     try {
       const t = music.currentTrack;
       out.id = t.persistentID(); out.name = t.name(); out.artist = t.artist();
@@ -247,6 +254,7 @@ function nowPlaying(): Now {
     try {
       out.plName = music.currentPlaylist.name();
       out.plCount = music.currentPlaylist.tracks.length;
+      out.plSpecial = music.currentPlaylist.specialKind();
     } catch (e) {} // no play context
     return JSON.stringify(out);
   `);
@@ -508,9 +516,6 @@ async function tui() {
   const albums = groupAlbums(library);
   const playlistNames = loadPlaylistNames();
   const playlistCache = new Map<string, Track[]>();
-  // Playing a single song puts Music in the library-wide "context", but it
-  // never actually continues through it — so that context is not a queue.
-  const libraryName: string = jxa(`return JSON.stringify(music.libraryPlaylists[0].name());`);
 
   process.stdout.write(`${ESC}?1049h${ESC}?25l${ESC}2J`); // alt screen, hide cursor
   process.stdin.setRawMode(true);
@@ -861,7 +866,10 @@ async function tui() {
 
   const tick = () => {
     now = nowPlaying();
-    const key = now.plName && now.plName !== libraryName ? `${now.plName}|${now.plCount}` : "";
+    // Only a real user playlist (specialKind "none") is a queue Music will
+    // actually play through — single-song plays land in the special "Music"
+    // master playlist, whose order never plays. That's not a queue.
+    const key = now.plName && now.plSpecial === "none" ? `${now.plName}|${now.plCount}` : "";
     if (key !== ctxKey) {
       ctxKey = key;
       ctx = key ? contextTracks() : { ids: [], names: [], artists: [] };
