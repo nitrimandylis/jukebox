@@ -725,19 +725,23 @@ async function tui() {
           });
         } else if (!lyricsMode) {
           // Up next: whatever rows remain, straight from the play context.
+          // Each entry is a wrapped name line over a dim wrapped artist line,
+          // with a blank row between entries so they read as separate songs.
           const curIdx = ctx.ids.indexOf(now.id);
           const upcoming = curIdx >= 0 ? ctx.ids.length - 1 - curIdx : 0;
-          const count = Math.min(8, room, upcoming);
-          if (count >= 2) {
+          if (upcoming > 0 && room >= 3) {
             section(now.shuffle ? "up next ⇄" : "up next");
-            for (let i = 0; i < count; i++) {
-              const j = curIdx + 1 + i;
-              // name at full intensity, artist dim — same contrast as the browse list
-              const w = inner - 2;
-              const name = clip(ctx.names[j], w);
-              const room = w - name.length;
-              const artist = room > 4 ? "  " + clip(ctx.artists[j], room - 2) : "";
-              box(nextY + 1 + i, name + DIM + artist + RESET, name.length + artist.length);
+            const w = inner - 2;
+            const maxY = nextY + room;
+            let y = nextY + 1, j = curIdx + 1, shown = 0;
+            while (j < ctx.ids.length && shown < 8 && y <= maxY) {
+              const nameRows = wrapText(ctx.names[j] || "", w);
+              const artistRows = ctx.artists[j] ? wrapText(ctx.artists[j], w) : [];
+              if (y + nameRows.length + artistRows.length - 1 > maxY) break; // whole entry or nothing
+              for (const t of nameRows) { const tt = clip(t, w); box(y++, tt, tt.length); }
+              for (const t of artistRows) { const tt = clip(t, w); box(y++, DIM + tt + RESET, tt.length); }
+              y++; // spacer
+              j++; shown++;
             }
           }
         }
