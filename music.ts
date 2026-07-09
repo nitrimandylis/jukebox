@@ -16,15 +16,14 @@
 //        music pause | next | prev  transport
 //        music shuffle | repeat     toggle / cycle
 //
-// TUI keys: j/k move · tab or 1/2/3 switch tabs · / filter · enter play
-//           l open album/playlist · h back · y lyrics · ␣ pause
+// TUI keys: j/k move · 1/2/3 switch tabs · ⇥ preview/lyrics · / filter
+//           enter play · l open album/playlist · h back · ␣ pause
 //           ←/→ prev/next track · +/- volume · s/r shuffle/repeat · q quit
 
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 
 const CACHE = `${tmpdir()}/music-cli`; // per-track artwork cache
-const FOOTER_MS = 6000; // keybind hints fade after this
 const TEMP_PLAYLIST = "music-cli"; // scratch playlist for album playback
 
 // ---------------------------------------------------------------------------
@@ -437,7 +436,7 @@ export function groupAlbums(tracks: Track[]): AlbumEntry[] {
   const byKey = new Map<string, AlbumEntry>();
   for (const t of tracks) {
     if (!t.album) continue;
-    const key = `${t.album} ${t.albumArtist || t.artist}`;
+    const key = `${t.album}\u0000${t.albumArtist || t.artist}`;
     let entry = byKey.get(key);
     if (!entry) {
       entry = { name: t.album, artist: t.albumArtist || t.artist, added: 0, tracks: [] };
@@ -526,12 +525,12 @@ async function tui() {
   let now: Now = nowPlaying();
   let lastFrame = ""; // art + border cache key
   let accent = "";
-  let footerUntil = Date.now() + FOOTER_MS;
   let flashKey = "", flashUntil = 0; // status item to show briefly after its key
   let ctx: { ids: string[]; names: string[]; artists: string[] } = { ids: [], names: [], artists: [] };
   let ctxKey = ""; // play-context cache: refetch only when the context changes
-  let lyricsMode = false;
+  let middleMode: "preview" | "lyrics" = "preview"; // what the middle panel shows
   let lyr: { id: string; lines: LyricLine[]; loading?: boolean } | null = null;
+  let previewFetch: ReturnType<typeof setTimeout> | null = null;
 
   const restore = () => {
     process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}?1049l${ESC}?25h`);
@@ -567,6 +566,42 @@ async function tui() {
   const selected = <T,>(all: T[], match: (x: T) => boolean): T | undefined =>
     all.filter(match)[cursor];
 
+  type Region = { x: number; y: number; w: number; h: number };
+
+  // What the preview panel shows: the track list behind the browse cursor.
+  const previewData = (): { title: string; tracks: Track[]; markId: string; loading?: boolean } | null => {
+    if (drill) {
+      const t = selected(drill.tracks, (x) => !filter || matches(x, filter));
+      return { title: drill.title, tracks: drill.tracks, markId: t ? t.id : "" };
+    }
+    if (tab === 0) {
+      const t = selected(library, (x) => !filter || matches(x, filter));
+      if (!t) return null;
+      const a = albums.find((al) => al.name === t.album && al.artist === (t.albumArtist || t.artist));
+      return a ? { title: a.name, tracks: a.tracks, markId: t.id } : null;
+    }
+    if (tab === 1) {
+      const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
+      return a ? { title: a.name, tracks: a.tracks, markId: "" } : null;
+    }
+    const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
+    if (!name) return null;
+    if (!playlistCache.has(name)) {
+      schedulePlaylistFetch(name);
+      return { title: name, tracks: [], markId: "", loading: true };
+    }
+    return { title: name, tracks: playlistCache.get(name)!, markId: "" };
+  };
+
+  // Debounced so holding j/k over the playlists list doesn't fetch per row.
+  const schedulePlaylistFetch = (name: string) => {
+    if (previewFetch) clearTimeout(previewFetch);
+    previewFetch = setTimeout(() => {
+      if (!playlistCache.has(name)) playlistCache.set(name, loadPlaylistTracks(name));
+      draw();
+    }, 300);
+  };
+
   const draw = () => {
     const cols = process.stdout.columns, rows = process.stdout.rows;
     if (cols < 40 || rows < 13) {
@@ -574,12 +609,26 @@ async function tui() {
       lastFrame = "";
       return;
     }
-    const H = rows - 1; // panels; last row is the footer
-    const wide = cols >= 72;
-    const R = wide ? 38 : Math.min(cols, 48); // player panel width
-    const B = wide ? Math.min(cols - R, 56) : 0; // browse panel width, kept narrow
-    const playerX = wide ? 1 : Math.max(1, Math.floor((cols - R) / 2) + 1);
-    const browseX = R + 1; // browse sits to the right of the player
+    const H = rows - 1; // last row is the footer
+    // Layout: three equal columns when there's width; stacked when there isn't.
+    let player: Region, middle: Region | null = null, browse: Region | null = null;
+    if (cols >= 90) {
+      const w = Math.floor(cols / 3);
+      player = { x: 1, y: 1, w, h: H };
+      middle = { x: w + 1, y: 1, w, h: H };
+      browse = { x: 2 * w + 1, y: 1, w: cols - 2 * w, h: H };
+    } else if (rows >= 34) {
+      const h = Math.floor(H / 3);
+      player = { x: 1, y: 1, w: cols, h };
+      middle = { x: 1, y: h + 1, w: cols, h };
+      browse = { x: 1, y: 2 * h + 1, w: cols, h: H - 2 * h };
+    } else if (rows >= 20) {
+      const h = Math.min(11, Math.floor(H / 2));
+      player = { x: 1, y: 1, w: cols, h };
+      browse = { x: 1, y: h + 1, w: cols, h: H - h };
+    } else {
+      player = { x: 1, y: 1, w: Math.min(cols, 48), h: H };
+    }
     const stopped = now.state === "stopped" || !now.id;
 
     const frame = `${now.id}|${cols}x${rows}|${stopped}`;
@@ -590,12 +639,28 @@ async function tui() {
     }
 
     const at = (x: number, y: number, text: string) => process.stdout.write(`${ESC}${y};${x}H${text}`);
+    const boxIn = (r: Region) => (y: number, text = "", visibleLen = 0) => {
+      const fill = " ".repeat(Math.max(0, r.w - 4 - visibleLen));
+      at(r.x, y, `${DIM}│${RESET} ${text}${fill} ${DIM}│${RESET}`);
+    };
+    // Bordered panel with a colored title; returns the inner-row writer.
+    const panel = (r: Region, title: string) => {
+      const inner = r.w - 2;
+      const t = clip(title, inner - 4);
+      at(r.x, r.y, `${DIM}╭─ ${RESET}${accent || BOLD}${t}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - t.length - 3))}╮${RESET}`);
+      const box = boxIn(r);
+      for (let y = r.y + 1; y < r.y + r.h - 1; y++) box(y);
+      at(r.x, r.y + r.h - 1, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
+      return box;
+    };
 
-    // ---- browse panel (hidden when the window is too narrow)
-    if (wide) {
-      const inner = B - 2;
+    // ---- browse panel
+    if (browse) {
+      const r = browse;
+      const browseX = r.x;
+      const inner = r.w - 2;
       const list = items();
-      const visible = H - 3; // minus borders and the filter row
+      const visible = r.h - 3; // minus borders and the filter row
       cursor = Math.max(0, Math.min(cursor, list.length - 1));
       if (cursor < scroll) scroll = cursor;
       if (cursor >= scroll + visible) scroll = cursor - visible + 1;
@@ -605,15 +670,15 @@ async function tui() {
       let title: string;
       if (drill) {
         title = `${TABS[tab]} ▸ ${clip(drill.title, inner - TABS[tab].length - 8)}`;
-        at(browseX, 1, `${DIM}╭─ ${RESET}${BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+        at(browseX, r.y, `${DIM}╭─ ${RESET}${BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
       } else {
         const strip = TABS.map((t, i) => (i === tab ? `${RESET}${accent || BOLD}${t}${RESET}${DIM}` : t)).join(" · ");
         title = TABS.join(" · ");
-        at(browseX, 1, `${DIM}╭─ ${strip} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+        at(browseX, r.y, `${DIM}╭─ ${strip} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
       }
 
       for (let i = 0; i < visible; i++) {
-        const y = 2 + i;
+        const y = r.y + 1 + i;
         const item = list[scroll + i];
         let content: string;
         if (!item) {
@@ -636,67 +701,19 @@ async function tui() {
       const count = `${list.length}`;
       const fLeft = clip(typing ? `/ ${filter}█` : filter ? `/ ${filter}` : "/ to filter", inner - count.length - 3);
       const fPad = " ".repeat(Math.max(0, inner - 2 - fLeft.length - count.length));
-      at(browseX, H - 1, `${DIM}│${RESET} ${typing ? RESET : DIM}${fLeft}${RESET}${fPad}${DIM}${count} │${RESET}`);
-      at(browseX, H, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
+      at(browseX, r.y + r.h - 2, `${DIM}│${RESET} ${typing ? RESET : DIM}${fLeft}${RESET}${fPad}${DIM}${count} │${RESET}`);
+      at(browseX, r.y + r.h - 1, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
     }
 
-    // ---- player panel
-    {
-      const W = R, inner = W - 2, x = playerX;
-      let artA = Math.min(inner - 6, (H - 13) * 2, 28);
-      artA -= artA % 2;
-      const showArt = !stopped && artA >= 10;
-      const artH = showArt ? artA / 2 : 0;
-
-      const box = (y: number, text = "", visibleLen = 0) => {
-        const fill = " ".repeat(Math.max(0, inner - 2 - visibleLen));
-        at(x, y, `${DIM}│${RESET} ${text}${fill} ${DIM}│${RESET}`);
-      };
-
-      const title = stopped ? "◼ stopped" : now.state === "paused" ? "▮▮ paused" : "♪ playing";
-      at(x, 1, `${DIM}╭─ ${RESET}${accent || BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
-      for (let y = 2; y < H; y++) box(y);
-      at(x, H, `${DIM}╰${"─".repeat(inner)}╯${RESET}`);
-
-      if (newFrame && showArt) {
-        const art = fetchArt(now.id);
-        if (art) {
-          drawArt(art.png, x + 1 + Math.floor((inner - artA) / 2), 3, artA, artH);
-          const [r, g, b] = liftAccent(art.accent);
-          accent = `${ESC}38;2;${r};${g};${b}m`;
+    // ---- middle panel: preview of the hovered item, or lyrics (⇥ switches)
+    if (middle) {
+      const r = middle, inner = r.w - 2, w = inner - 2, roomRows = r.h - 2;
+      if (middleMode === "lyrics") {
+        const box = panel(r, "lyrics");
+        if (stopped) {
+          const msg = "nothing playing";
+          box(r.y + Math.floor(r.h / 2), DIM + msg + RESET, msg.length);
         } else {
-          accent = "";
-        }
-      }
-
-      if (stopped) {
-        const msg = "nothing playing";
-        box(Math.floor(H / 2), DIM + msg + RESET, msg.length);
-      } else {
-        const infoY = showArt ? 3 + artH + 1 : 3;
-        const name = clip(now.name, inner - 2);
-        const artistAlbum = clip(`${now.artist} — ${now.album}`, inner - 2);
-        box(infoY, BOLD + name + RESET, name.length);
-        box(infoY + 1, DIM + artistAlbum + RESET, artistAlbum.length);
-        // genre · year · plays · ♥ — only the parts that exist
-        const parts = [now.genre, now.year ? `${now.year}` : "", now.plays ? `${now.plays} plays` : "", now.fav ? "♥" : ""]
-          .filter(Boolean);
-        const details = clip(parts.join(" · "), inner - 2);
-        box(infoY + 2, DIM + details + RESET, details.length);
-        const barW = inner - 2;
-        box(infoY + 4, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET), barW);
-        const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
-        box(infoY + 5, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
-
-        // The section below the times: lyrics when toggled on, up next otherwise.
-        const nextY = infoY + 7;
-        const room = H - 3 - nextY; // keep the bottom rows for the status section
-        const section = (header: string) =>
-          at(x, nextY, `${DIM}├─ ${header} ${"─".repeat(Math.max(0, inner - header.length - 4))}┤${RESET}`);
-
-        if (lyricsMode && room >= 3) {
-          section("lyrics");
-          const w = inner - 2;
           let view: { text: string; cur: boolean }[];
           if (!lyr || lyr.id !== now.id || lyr.loading) {
             view = [{ text: "fetching lyrics…", cur: false }];
@@ -711,38 +728,105 @@ async function tui() {
             let top: number;
             if (synced) {
               const curRow = flat.findIndex((f) => f.line === curLine);
-              top = Math.max(0, (curRow < 0 ? 0 : curRow) - Math.floor(room / 3));
+              top = Math.max(0, (curRow < 0 ? 0 : curRow) - Math.floor(roomRows / 3));
             } else {
               // ponytail: unsynced lyrics scroll by song progress, close enough
-              top = Math.floor((now.pos / Math.max(1, now.duration)) * Math.max(0, flat.length - room));
+              top = Math.floor((now.pos / Math.max(1, now.duration)) * Math.max(0, flat.length - roomRows));
             }
-            top = Math.min(top, Math.max(0, flat.length - room));
-            view = flat.slice(top, top + room).map((f) => ({ text: f.text, cur: synced && f.line === curLine }));
+            top = Math.min(top, Math.max(0, flat.length - roomRows));
+            view = flat.slice(top, top + roomRows).map((f) => ({ text: f.text, cur: synced && f.line === curLine }));
           }
-          view.slice(0, room).forEach((rw, i) => {
+          view.slice(0, roomRows).forEach((rw, i) => {
             const text = clip(rw.text, w);
-            box(nextY + 1 + i, rw.cur ? (accent || BOLD) + text + RESET : DIM + text + RESET, text.length);
+            box(r.y + 1 + i, rw.cur ? (accent || BOLD) + text + RESET : DIM + text + RESET, text.length);
           });
-        } else if (!lyricsMode) {
-          // Up next: whatever rows remain, straight from the play context.
-          // Each entry is a wrapped name line over a dim wrapped artist line,
-          // with a blank row between entries so they read as separate songs.
-          const curIdx = ctx.ids.indexOf(now.id);
-          const upcoming = curIdx >= 0 ? ctx.ids.length - 1 - curIdx : 0;
-          if (upcoming > 0 && room >= 3) {
-            section(now.shuffle ? "up next ⇄" : "up next");
-            const w = inner - 2;
-            const maxY = nextY + room;
-            let y = nextY + 1, j = curIdx + 1, shown = 0;
-            while (j < ctx.ids.length && shown < 8 && y <= maxY) {
-              const nameRows = wrapText(ctx.names[j] || "", w);
-              const artistRows = ctx.artists[j] ? wrapText(ctx.artists[j], w) : [];
-              if (y + nameRows.length + artistRows.length - 1 > maxY) break; // whole entry or nothing
-              for (const t of nameRows) { const tt = clip(t, w); box(y++, tt, tt.length); }
-              for (const t of artistRows) { const tt = clip(t, w); box(y++, DIM + tt + RESET, tt.length); }
-              y++; // spacer
-              j++; shown++;
-            }
+        }
+      } else {
+        const pv = previewData();
+        const box = panel(r, pv ? `preview ▸ ${pv.title}` : "preview");
+        if (!pv) {
+          const msg = "nothing to preview";
+          box(r.y + Math.floor(r.h / 2), DIM + msg + RESET, msg.length);
+        } else if (pv.loading) {
+          box(r.y + 1, DIM + "loading…" + RESET, 8);
+        } else {
+          const markIdx = pv.tracks.findIndex((t) => t.id === pv.markId);
+          let top = Math.max(0, (markIdx < 0 ? 0 : markIdx) - Math.floor(roomRows / 2));
+          top = Math.min(top, Math.max(0, pv.tracks.length - roomRows));
+          for (let i = 0; i < Math.min(roomRows, pv.tracks.length - top); i++) {
+            const t = pv.tracks[top + i];
+            const isMark = top + i === markIdx;
+            const isNow = t.id === now.id;
+            const num = String(top + i + 1).padStart(2);
+            const nm = clip(t.name, w - 5);
+            const marker = isNow ? `${accent || BOLD}♪${RESET}` : " ";
+            box(r.y + 1 + i, `${DIM}${num}${RESET} ${marker} ${isMark ? BOLD + nm + RESET : nm}`, num.length + 3 + nm.length);
+          }
+        }
+      }
+    }
+
+    // ---- player panel
+    {
+      const r = player, inner = r.w - 2, x = r.x;
+      let artA = Math.min(inner - 6, (r.h - 13) * 2, 28);
+      artA -= artA % 2;
+      const showArt = !stopped && artA >= 10;
+      const artH = showArt ? artA / 2 : 0;
+
+      const title = stopped ? "◼ stopped" : now.state === "paused" ? "▮▮ paused" : "♪ playing";
+      const box = panel(r, title);
+
+      if (newFrame && showArt) {
+        const art = fetchArt(now.id);
+        if (art) {
+          drawArt(art.png, x + 1 + Math.floor((inner - artA) / 2), r.y + 2, artA, artH);
+          const [rd, gn, bl] = liftAccent(art.accent);
+          accent = `${ESC}38;2;${rd};${gn};${bl}m`;
+        } else {
+          accent = "";
+        }
+      }
+
+      if (stopped) {
+        const msg = "nothing playing";
+        box(r.y + Math.floor(r.h / 2), DIM + msg + RESET, msg.length);
+      } else {
+        const infoY = r.y + (showArt ? artH + 3 : 2);
+        const name = clip(now.name, inner - 2);
+        const artistAlbum = clip(`${now.artist} — ${now.album}`, inner - 2);
+        box(infoY, BOLD + name + RESET, name.length);
+        box(infoY + 1, DIM + artistAlbum + RESET, artistAlbum.length);
+        // genre · year · plays · ♥ — only the parts that exist
+        const parts = [now.genre, now.year ? `${now.year}` : "", now.plays ? `${now.plays} plays` : "", now.fav ? "♥" : ""]
+          .filter(Boolean);
+        const details = clip(parts.join(" · "), inner - 2);
+        box(infoY + 2, DIM + details + RESET, details.length);
+        const barW = inner - 2;
+        box(infoY + 4, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET), barW);
+        const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
+        box(infoY + 5, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
+
+        // Up next: whatever rows remain, straight from the play context.
+        // Each entry is a wrapped name line over a dim wrapped artist line,
+        // with a blank row between entries so they read as separate songs.
+        const nextY = infoY + 7;
+        const maxY = r.y + r.h - 4; // keep the bottom rows for the status section
+        const curIdx = ctx.ids.indexOf(now.id);
+        const upcoming = curIdx >= 0 ? ctx.ids.length - 1 - curIdx : 0;
+        if (upcoming > 0 && maxY - nextY >= 2) {
+          const header = now.shuffle ? "up next ⇄" : "up next";
+          at(x, nextY, `${DIM}├─ ${header} ${"─".repeat(Math.max(0, inner - header.length - 4))}┤${RESET}`);
+          const w = inner - 2;
+          let y = nextY + 1, j = curIdx + 1, shown = 0;
+          while (j < ctx.ids.length && shown < 8 && y <= maxY) {
+            const nameRows = wrapText(ctx.names[j] || "", w);
+            const artistRows = ctx.artists[j] ? wrapText(ctx.artists[j], w) : [];
+            if (y + nameRows.length + artistRows.length - 1 > maxY) break; // whole entry or nothing
+            for (const t of nameRows) { const tt = clip(t, w); box(y++, tt, tt.length); }
+            for (const t of artistRows) { const tt = clip(t, w); box(y++, DIM + tt + RESET, tt.length); }
+            y++; // spacer
+            j++; shown++;
           }
         }
       }
@@ -755,22 +839,20 @@ async function tui() {
       if (now.repeat !== "off" || flashing("repeat")) items.push(`↻ ${now.repeat}`);
       if (now.vol !== 100 || flashing("vol")) items.push(`vol ${now.vol}`);
       if (items.length > 0) {
-        at(x, H - 2, `${DIM}├${"─".repeat(inner)}┤${RESET}`);
+        at(x, r.y + r.h - 3, `${DIM}├${"─".repeat(inner)}┤${RESET}`);
         const status = items.join("   ");
-        box(H - 1, DIM + status + RESET, status.length);
+        box(r.y + r.h - 2, DIM + status + RESET, status.length);
       }
     }
 
     // ---- footer
-    const hints = wide
-      ? "enter play · l open · h back · / filter · ⇥ tabs · y lyrics · ␣ pause · ←/→ skip · +/- vol · s/r modes · q quit"
-      : "y lyrics · ␣ pause · ←/→ skip · +/- vol · s/r modes · q quit (widen for the browser)";
-    at(1, rows, `${ESC}2K` + (Date.now() < footerUntil ? " " + DIM + clip(hints, cols - 2) + RESET : ""));
+    const hints = "enter play · l open · h back · / filter · 1/2/3 tabs · ⇥ preview/lyrics · ␣ pause · ←/→ skip · +/- vol · s/r modes · q quit";
+    at(1, rows, `${ESC}2K ` + DIM + clip(hints, cols - 2) + RESET);
   };
 
   // Fetch lyrics for the current track once, only while the view is open.
   const ensureLyrics = () => {
-    if (!lyricsMode || !now.id || (lyr && lyr.id === now.id)) return;
+    if (middleMode !== "lyrics" || !now.id || (lyr && lyr.id === now.id)) return;
     const id = now.id;
     lyr = { id, lines: [], loading: true };
     fetchLyrics(now).then((lines) => {
@@ -839,7 +921,6 @@ async function tui() {
   });
 
   const handleKey = (k: string) => {
-    footerUntil = Date.now() + FOOTER_MS;
     if (k === "\x03") cleanup(); // ctrl-c always wins
 
     if (typing) {
@@ -856,10 +937,9 @@ async function tui() {
       case "k": case `${ESC}A`: cursor--; break;
       case "g": cursor = 0; break;
       case "G": cursor = Infinity; break;
-      case "\t": tab = (tab + 1) % 3; drill = null; resetList(); break;
+      case "\t": middleMode = middleMode === "preview" ? "lyrics" : "preview"; ensureLyrics(); break;
       case "1": case "2": case "3": tab = +k - 1; drill = null; resetList(); break;
       case "/": typing = true; filter = ""; cursor = 0; scroll = 0; break;
-      case "y": lyricsMode = !lyricsMode; ensureLyrics(); break;
       case "l": openSelection(); return;
       case "h": case "\x1b":
         if (drill) { drill = null; resetList(); }
@@ -914,7 +994,7 @@ options:
 
 TUI keys:
   j/k or ↑/↓ move · enter play · l open album/playlist · h back
-  tab or 1/2/3 switch tabs · / filter · esc clear · y lyrics
+  1/2/3 switch tabs · tab preview/lyrics panel · / filter · esc clear
   space pause · ←/→ prev/next · +/- volume · s shuffle · r repeat · q quit
 
 lyrics come from lrclib.net (sends title/artist/duration when the view is open)`;

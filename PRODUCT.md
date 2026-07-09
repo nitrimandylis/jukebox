@@ -9,13 +9,16 @@ register: product (a tool — design serves the product)
 
 ## What it is
 
-- **The TUI is the main way in**: bare `music` opens a two-panel app,
-  lazygit-style. Left: a browser with songs / albums / playlists tabs — the
+- **The TUI is the main way in**: bare `music` opens a three-panel app,
+  lazygit-style, in equal-width columns (stacking vertically on narrow
+  terminals). Left: the now-playing panel — album art as real pixels (Kitty
+  graphics), progress bar tinted with the cover's dominant color. Middle:
+  a preview panel showing the track list behind the browse cursor (hover an
+  album/playlist to see inside before committing), or lyrics — ⇥ switches.
+  Right: the browser with songs / albums / playlists tabs (1/2/3) — the
   whole library is bulk-fetched once at startup (~0.2s for ~1700 tracks) and
   filtered locally with `/`, newest additions first. Enter plays; `l` drills
-  into an album/playlist and enter inside plays it from that track. Right:
-  the now-playing panel — album art as real pixels (Kitty graphics), progress
-  bar tinted with the cover's dominant color, shuffle/repeat/volume status.
+  into an album/playlist and enter inside plays it from that track.
   The player also shows a dim details line (genre · year · plays · ♥) and an
   "up next" section fed by the current play context, refreshed only when the
   context changes. `y` swaps that section for lyrics (lrclib.net, keyless,
