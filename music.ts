@@ -167,9 +167,18 @@ function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
     const all = active && currentId ? [currentId, ...leftover, ...${JSON.stringify(ids)}] : ${JSON.stringify(ids)};
     for (const id of all) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
     if (active && currentId) {
+      // pl.play() restarts the current song from 0:00 before the seek lands,
+      // which is audible. Mute for the jump and seek twice — once right away,
+      // once after the track has actually loaded — so it reads as a short
+      // silence instead of a restart.
+      const vol = music.soundVolume();
+      music.soundVolume = 0;
       pl.play(); // the only call that makes Music adopt the playlist as its context
       music.playerPosition = pos;
+      delay(0.3);
+      music.playerPosition = pos;
       if (state === "paused") music.playpause();
+      music.soundVolume = vol;
       return JSON.stringify({ mode: "switched", shuffle });
     }
     pl.play();
