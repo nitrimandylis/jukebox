@@ -732,8 +732,12 @@ async function tui() {
             section(now.shuffle ? "up next ⇄" : "up next");
             for (let i = 0; i < count; i++) {
               const j = curIdx + 1 + i;
-              const line = clip(`${ctx.names[j]}  ${ctx.artists[j]}`, inner - 2);
-              box(nextY + 1 + i, DIM + line + RESET, line.length);
+              // name at full intensity, artist dim — same contrast as the browse list
+              const w = inner - 2;
+              const name = clip(ctx.names[j], w);
+              const room = w - name.length;
+              const artist = room > 4 ? "  " + clip(ctx.artists[j], room - 2) : "";
+              box(nextY + 1 + i, name + DIM + artist + RESET, name.length + artist.length);
             }
           }
         }
