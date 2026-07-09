@@ -16,7 +16,11 @@ register: product (a tool — design serves the product)
   into an album/playlist and enter inside plays it from that track. Right:
   the now-playing panel — album art as real pixels (Kitty graphics), progress
   bar tinted with the cover's dominant color, shuffle/repeat/volume status.
-  Transport keys are global: space pause, n/p skip, +/- volume, s/r modes.
+  The player also shows a dim details line (genre · year · plays · ♥) and an
+  "up next" section fed by the current play context, refreshed only when the
+  context changes. Status items (shuffle/repeat/volume) appear only when
+  non-default, flashing briefly after their key. Transport keys are global:
+  space pause, ←/→ skip, +/- volume, s/r modes.
 - **Quick commands are the extras**: `music play <query>` (fzf-pick a song),
   `music queue <query>` (fzf multi-select songs to play next; bare `queue`
   shows what's coming), `music album` / `music playlist` (pick and play

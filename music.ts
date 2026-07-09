@@ -230,20 +230,41 @@ function playPlaylist(name: string, startId?: string) {
 type Now = {
   state: string; vol: number; shuffle: boolean; repeat: string;
   id: string; name: string; artist: string; album: string; duration: number; pos: number;
+  genre: string; year: number; plays: number; fav: boolean;
+  plName: string; plCount: number; // current play context, for "up next"
 };
 
 function nowPlaying(): Now {
   return jxa(`
     const out = { state: music.playerState(), vol: music.soundVolume(),
       shuffle: music.shuffleEnabled(), repeat: music.songRepeat(),
-      id: "", name: "", artist: "", album: "", duration: 0, pos: 0 };
+      id: "", name: "", artist: "", album: "", duration: 0, pos: 0,
+      genre: "", year: 0, plays: 0, fav: false, plName: "", plCount: 0 };
     try {
       const t = music.currentTrack;
       out.id = t.persistentID(); out.name = t.name(); out.artist = t.artist();
       out.album = t.album(); out.duration = t.duration();
       out.pos = music.playerPosition() || 0;
+      out.genre = t.genre() || ""; out.year = t.year() || 0;
+      out.plays = t.playedCount() || 0;
+      try { out.fav = t.favorited(); } catch (e) {}
     } catch (e) {} // no current track
+    try {
+      out.plName = music.currentPlaylist.name();
+      out.plCount = music.currentPlaylist.tracks.length;
+    } catch (e) {} // no play context
     return JSON.stringify(out);
+  `);
+}
+
+// The tracks of whatever Music is currently playing from, in play order.
+// Bulk-fetched once per context change (a library-sized context takes ~0.2s).
+function contextTracks(): { ids: string[]; names: string[]; artists: string[] } {
+  return jxa(`
+    try {
+      const tr = music.currentPlaylist.tracks;
+      return JSON.stringify({ ids: tr.persistentID(), names: tr.name(), artists: tr.artist() });
+    } catch (e) { return JSON.stringify({ ids: [], names: [], artists: [] }); }
   `);
 }
 
@@ -441,6 +462,8 @@ async function tui() {
   let accent = "";
   let footerUntil = Date.now() + FOOTER_MS;
   let flashKey = "", flashUntil = 0; // status item to show briefly after its key
+  let ctx: { ids: string[]; names: string[]; artists: string[] } = { ids: [], names: [], artists: [] };
+  let ctxKey = ""; // play-context cache: refetch only when the context changes
 
   const restore = () => {
     process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}?1049l${ESC}?25h`);
@@ -587,10 +610,31 @@ async function tui() {
         const artistAlbum = clip(`${now.artist} — ${now.album}`, inner - 2);
         box(infoY, BOLD + name + RESET, name.length);
         box(infoY + 1, DIM + artistAlbum + RESET, artistAlbum.length);
+        // genre · year · plays · ♥ — only the parts that exist
+        const parts = [now.genre, now.year ? `${now.year}` : "", now.plays ? `${now.plays} plays` : "", now.fav ? "♥" : ""]
+          .filter(Boolean);
+        const details = clip(parts.join(" · "), inner - 2);
+        box(infoY + 2, DIM + details + RESET, details.length);
         const barW = inner - 2;
-        box(infoY + 3, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET), barW);
+        box(infoY + 4, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET), barW);
         const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
-        box(infoY + 4, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
+        box(infoY + 5, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
+
+        // Up next: whatever rows remain, straight from the play context.
+        const nextY = infoY + 7;
+        const room = H - 3 - nextY; // keep the bottom rows for the status section
+        const curIdx = ctx.ids.indexOf(now.id);
+        const upcoming = curIdx >= 0 ? ctx.ids.length - 1 - curIdx : 0;
+        const count = Math.min(8, room, upcoming);
+        if (count >= 2) {
+          const header = now.shuffle ? "up next ⇄" : "up next";
+          at(x, nextY, `${DIM}├─ ${header} ${"─".repeat(Math.max(0, inner - header.length - 4))}┤${RESET}`);
+          for (let i = 0; i < count; i++) {
+            const j = curIdx + 1 + i;
+            const line = clip(`${ctx.names[j]}  ${ctx.artists[j]}`, inner - 2);
+            box(nextY + 1 + i, DIM + line + RESET, line.length);
+          }
+        }
       }
       // Status items earn their space only when non-default — or for a
       // moment after their key was pressed, so toggling back to default
@@ -614,7 +658,15 @@ async function tui() {
     at(1, rows, `${ESC}2K` + (Date.now() < footerUntil ? " " + DIM + clip(hints, cols - 2) + RESET : ""));
   };
 
-  const tick = () => { now = nowPlaying(); draw(); };
+  const tick = () => {
+    now = nowPlaying();
+    const key = now.plName ? `${now.plName}|${now.plCount}` : "";
+    if (key !== ctxKey) {
+      ctxKey = key;
+      ctx = key ? contextTracks() : { ids: [], names: [], artists: [] };
+    }
+    draw();
+  };
   // Music.app applies sets asynchronously; poll again shortly after acting
   // so the panel catches up.
   const act = (body: string, flash = "") => {
