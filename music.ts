@@ -204,10 +204,6 @@ function pick(lines: string[], header: string): number | null {
 const ESC = "\x1b[";
 const BOLD = `${ESC}1m`, DIM = `${ESC}2m`, RESET = `${ESC}0m`;
 
-function center(text: string, cols: number, visibleLen: number): string {
-  return " ".repeat(Math.max(0, Math.floor((cols - visibleLen) / 2))) + text;
-}
-
 async function liveView() {
   if (!process.stdout.isTTY) {
     console.error("the live view needs a terminal; try `music search <query>`");
@@ -217,7 +213,7 @@ async function liveView() {
   process.stdin.setRawMode(true);
   process.stdin.resume();
 
-  let lastArtId = "";
+  let lastFrame = ""; // id|size|state key; borders + art redraw only when it changes
   let footerUntil = Date.now() + FOOTER_MS;
   let accent = "";
 
@@ -231,50 +227,80 @@ async function liveView() {
   const render = () => {
     const cols = process.stdout.columns, rows = process.stdout.rows;
     const now = nowPlaying();
+    const stopped = now.state === "stopped" || !now.id;
 
-    // Layout: art is a square of W cells × W/2 rows (cells are ~1:2), leaving
-    // 9 rows of text below it. Everything centers on the art column.
-    let artW = Math.min(cols - 8, (rows - 11) * 2, 64);
-    artW -= artW % 2;
-    const showArt = artW >= 10;
-    const artH = artW / 2;
-    const left = Math.max(1, Math.floor((cols - artW) / 2) + 1);
-    const textTop = showArt ? artH + 3 : 2;
+    // One lazygit-style panel: rounded border, state in the title, a divider
+    // before the status row. Art sits small and centered near the top.
+    const W = Math.min(cols - 2, 48); // panel width, borders included
+    const inner = W - 2;
+    if (cols < 24 || rows < 13) {
+      process.stdout.write(`${ESC}2J${ESC}1;1H${DIM}terminal too small${RESET}`);
+      lastFrame = "";
+      return;
+    }
+    let artA = Math.min(inner - 8, (rows - 15) * 2, 28); // quarter-scale cover
+    artA -= artA % 2;
+    const showArt = !stopped && artA >= 10;
+    const artH = showArt ? artA / 2 : 0;
+    const panelH = artH + 11;
+    const left = Math.max(1, Math.floor((cols - W) / 2) + 1);
+    const top = Math.max(1, Math.floor((rows - panelH - 2) / 2) + 1);
 
-    if (now.state === "stopped" || !now.id) {
+    const at = (y: number, text: string) => process.stdout.write(`${ESC}${y};${left}H${text}`);
+    const boxRow = (y: number, text = "", visible = 0) => {
+      const fill = " ".repeat(Math.max(0, inner - 2 - visible));
+      at(y, `${DIM}│${RESET} ${text}${fill} ${DIM}│${RESET}`);
+    };
+    const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) + "…" : s);
+
+    // Rows inside the panel, top border = `top`.
+    const artTop = top + 2;
+    const nameRow = artTop + artH + 1;
+    const barRow = nameRow + 3;
+    const divRow = barRow + 2;
+    const frame = `${now.id}|${cols}x${rows}|${stopped}`;
+
+    if (frame !== lastFrame) {
       process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}2J`);
-      lastArtId = "";
+      for (let y = top + 1; y < top + panelH - 1; y++) boxRow(y);
+      at(divRow, DIM + "├" + "─".repeat(inner) + "┤" + RESET);
+      at(top + panelH - 1, DIM + "╰" + "─".repeat(inner) + "╯" + RESET);
+      if (showArt) {
+        const art = fetchArt(now.id);
+        if (art) {
+          drawArt(art.png, left + 1 + Math.floor((inner - artA) / 2), artTop, artA, artH);
+          const [r, g, b] = liftAccent(art.accent);
+          accent = `${ESC}38;2;${r};${g};${b}m`;
+        } else {
+          accent = "";
+        }
+      }
+      lastFrame = frame;
+    }
+
+    // Title carries the player state, tinted with the cover's accent.
+    const title = stopped ? "◼ stopped" : now.state === "paused" ? "▮▮ paused" : "♪ playing";
+    at(top, `${DIM}╭─ ${RESET}${accent || BOLD}${title}${RESET}${DIM} ${"─".repeat(Math.max(0, inner - title.length - 3))}╮${RESET}`);
+
+    if (stopped) {
       const msg = "nothing playing — music play <query>";
-      process.stdout.write(`${ESC}${Math.floor(rows / 2)};1H` + center(DIM + msg + RESET, cols, msg.length));
+      boxRow(nameRow, DIM + clip(msg, inner - 2) + RESET, Math.min(msg.length, inner - 2));
+      boxRow(top + panelH - 2, "");
       return;
     }
 
-    if (showArt && now.id !== lastArtId) {
-      process.stdout.write(`${ESC}2J`);
-      const art = fetchArt(now.id);
-      if (art) {
-        drawArt(art.png, left, 2, artW, artH);
-        const [r, g, b] = liftAccent(art.accent);
-        accent = `${ESC}38;2;${r};${g};${b}m`;
-      } else {
-        accent = "";
-      }
-      lastArtId = now.id;
-    }
-
-    const line = (offset: number, text: string) =>
-      process.stdout.write(`${ESC}${textTop + offset};1H${ESC}2K${ESC}${textTop + offset};${left}H${text}`);
-
-    const clip = (s: string) => (s.length > artW ? s.slice(0, artW - 1) + "…" : s);
-    line(0, BOLD + clip(now.name) + RESET);
-    line(1, DIM + clip(`${now.artist} — ${now.album}`) + RESET);
-    line(3, progressBar(now.pos, now.duration, artW, accent || BOLD, DIM, RESET));
-    const total = fmtTime(now.duration);
-    const elapsed = fmtTime(now.pos);
-    line(4, DIM + elapsed + " ".repeat(Math.max(1, artW - elapsed.length - total.length)) + total + RESET);
-    const paused = now.state === "paused" ? "▮▮ paused   " : "";
-    line(6, DIM + `${paused}⇄ ${now.shuffle ? "on" : "off"}   ↻ ${now.repeat}   vol ${now.vol}` + RESET);
-    line(7, Date.now() < footerUntil ? DIM + "␣ pause · n/p skip · +/- vol · s/r modes · q quit" + RESET : "");
+    const name = clip(now.name, inner - 2);
+    const artistAlbum = clip(`${now.artist} — ${now.album}`, inner - 2);
+    boxRow(nameRow, BOLD + name + RESET, name.length);
+    boxRow(nameRow + 1, DIM + artistAlbum + RESET, artistAlbum.length);
+    const barW = inner - 2;
+    boxRow(barRow, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET), barW);
+    const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
+    boxRow(barRow + 1, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
+    const status = `⇄ ${now.shuffle ? "on" : "off"}   ↻ ${now.repeat}   vol ${now.vol}`;
+    boxRow(divRow + 1, DIM + status + RESET, status.length);
+    const hints = "␣ pause · n/p skip · +/- vol · s/r · q quit";
+    at(top + panelH + 1, `${ESC}2K` + (Date.now() < footerUntil ? DIM + clip(hints, W) + RESET : ""));
   };
 
   // Music.app applies sets asynchronously; render now and again shortly
