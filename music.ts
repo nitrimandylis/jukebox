@@ -782,9 +782,19 @@ async function tui() {
     // ---- player panel
     {
       const r = player, inner = r.w - 2, x = r.x;
-      let artA = Math.min(inner - 6, (r.h - 13) * 2, 28);
+      // Two arrangements: a tall column puts the art on top (scaling with
+      // the window, reserving rows for up-next when it can); a wide, short
+      // panel (stacked layout) puts the art left of the text so it survives
+      // any panel height.
+      const sideArt = r.w > r.h * 3;
+      let artA: number;
+      if (sideArt) {
+        artA = Math.min((r.h - 2) * 2, Math.floor(inner / 2));
+      } else {
+        artA = Math.min(inner - 6, Math.max(28, (r.h - 19) * 2), (r.h - 13) * 2);
+      }
       artA -= artA % 2;
-      const showArt = !stopped && artA >= 10;
+      const showArt = !stopped && artA >= 8;
       const artH = showArt ? artA / 2 : 0;
 
       const title = stopped ? "◼ stopped" : now.state === "paused" ? "▮▮ paused" : "♪ playing";
@@ -793,7 +803,9 @@ async function tui() {
       if (newFrame && showArt) {
         const art = fetchArt(now.id);
         if (art) {
-          drawArt(art.png, x + 1 + Math.floor((inner - artA) / 2), r.y + 2, artA, artH);
+          const ax = sideArt ? x + 2 : x + 1 + Math.floor((inner - artA) / 2);
+          const ay = sideArt ? r.y + 1 + Math.floor((r.h - 2 - artH) / 2) : r.y + 2;
+          drawArt(art.png, ax, ay, artA, artH);
           const [rd, gn, bl] = liftAccent(art.accent);
           accent = `${ESC}38;2;${rd};${gn};${bl}m`;
         } else {
@@ -801,9 +813,32 @@ async function tui() {
         }
       }
 
+      const flashing = (k: string) => flashKey === k && Date.now() < flashUntil;
+      const statusItems: string[] = [];
+      if (now.shuffle || flashing("shuffle")) statusItems.push(`⇄ ${now.shuffle ? "on" : "off"}`);
+      if (now.repeat !== "off" || flashing("repeat")) statusItems.push(`↻ ${now.repeat}`);
+      if (now.vol !== 100 || flashing("vol")) statusItems.push(`vol ${now.vol}`);
+
       if (stopped) {
         const msg = "nothing playing";
         box(r.y + Math.floor(r.h / 2), DIM + msg + RESET, msg.length);
+      } else if (sideArt) {
+        // text block to the right of the art (rows are pre-blanked by panel())
+        const tx = x + 2 + (showArt ? artA + 2 : 0);
+        const tw = x + r.w - 2 - tx;
+        const put = (y: number, text: string) => at(tx, y, text);
+        put(r.y + 2, BOLD + clip(now.name, tw) + RESET);
+        put(r.y + 3, DIM + clip(`${now.artist} — ${now.album}`, tw) + RESET);
+        const parts = [now.genre, now.year ? `${now.year}` : "", now.plays ? `${now.plays} plays` : "", now.fav ? "♥" : ""]
+          .filter(Boolean);
+        put(r.y + 4, DIM + clip(parts.join(" · "), tw) + RESET);
+        const barW = tw - 1;
+        if (barW >= 8) {
+          put(r.y + 6, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET));
+          const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
+          put(r.y + 7, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET);
+        }
+        if (statusItems.length > 0) put(r.y + r.h - 2, DIM + statusItems.join("   ") + RESET);
       } else {
         const infoY = r.y + (showArt ? artH + 3 : 2);
         const name = clip(now.name, inner - 2);
@@ -842,19 +877,14 @@ async function tui() {
             j++; shown++;
           }
         }
-      }
-      // Status items earn their space only when non-default — or for a
-      // moment after their key was pressed, so toggling back to default
-      // still gives feedback.
-      const flashing = (k: string) => flashKey === k && Date.now() < flashUntil;
-      const items: string[] = [];
-      if (now.shuffle || flashing("shuffle")) items.push(`⇄ ${now.shuffle ? "on" : "off"}`);
-      if (now.repeat !== "off" || flashing("repeat")) items.push(`↻ ${now.repeat}`);
-      if (now.vol !== 100 || flashing("vol")) items.push(`vol ${now.vol}`);
-      if (items.length > 0) {
-        at(x, r.y + r.h - 3, `${DIM}├${"─".repeat(inner)}┤${RESET}`);
-        const status = items.join("   ");
-        box(r.y + r.h - 2, DIM + status + RESET, status.length);
+        // Status items earn their space only when non-default — or for a
+        // moment after their key was pressed, so toggling back to default
+        // still gives feedback.
+        if (statusItems.length > 0) {
+          at(x, r.y + r.h - 3, `${DIM}├${"─".repeat(inner)}┤${RESET}`);
+          const status = statusItems.join("   ");
+          box(r.y + r.h - 2, DIM + status + RESET, status.length);
+        }
       }
     }
 
