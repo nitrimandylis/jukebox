@@ -1,0 +1,11 @@
+{
+  "name": "music-cli",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "music": "./music.ts"
+  },
+  "scripts": {
+    "compile": "bun build --compile music.ts --outfile ~/.bun/bin/music"
+  }
+}
