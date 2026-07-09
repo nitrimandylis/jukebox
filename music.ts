@@ -108,20 +108,13 @@ function searchLibrary(query: string): Song[] {
   `);
 }
 
-function playSongById(id: string): boolean {
-  return jxa(`
-    const found = music.libraryPlaylists[0].tracks.whose({ persistentID: ${JSON.stringify(id)} });
-    if (found.length === 0) return JSON.stringify(false);
-    found[0].play();
-    return JSON.stringify(true);
-  `);
-}
-
 // Music.app has no scriptable "play these tracks": the reliable trick is a
 // throwaway playlist. Playing an individual track object NEVER adopts the
-// playlist as the play context (verified: context stays wherever it was), so
-// the only reliable move is pl.play() — to start mid-list, build the
-// playlist from that track onward.
+// playlist as the play context (verified: context stays wherever it was) —
+// worse, Music then *reports* some arbitrary playlist containing the track
+// as currentPlaylist without ever intending to continue through it. So
+// every play, even a single song, goes through the scratch playlist and
+// pl.play() — to start mid-list, build the playlist from that track onward.
 function playTracksAsPlaylist(ids: string[], startId?: string) {
   const start = startId ? Math.max(0, ids.indexOf(startId)) : 0;
   const list = ids.slice(start);
@@ -912,7 +905,7 @@ async function tui() {
       playTracksAsPlaylist(drill.tracks.map((x) => x.id), t.id);
     } else if (tab === 0) {
       const t = selected(library, (x) => !filter || matches(x, filter));
-      if (t) playSongById(t.id);
+      if (t) playTracksAsPlaylist([t.id]);
     } else if (tab === 1) {
       const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
       if (a) playTracksAsPlaylist(a.tracks.map((x) => x.id));
@@ -1070,10 +1063,7 @@ function main() {
       if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
       const i = pick(songs.map(songLabel), "play");
       if (i === null) return;
-      if (!playSongById(songs[i].id)) {
-        console.error("that track has vanished from the library");
-        process.exit(1);
-      }
+      playTracksAsPlaylist([songs[i].id]);
       console.log(`▶ ${songs[i].name} — ${songs[i].artist}`);
       break;
     }
