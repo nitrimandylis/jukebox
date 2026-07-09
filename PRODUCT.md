@@ -18,8 +18,9 @@ register: product (a tool — design serves the product)
   bar tinted with the cover's dominant color, shuffle/repeat/volume status.
   Transport keys are global: space pause, n/p skip, +/- volume, s/r modes.
 - **Quick commands are the extras**: `music play <query>` (fzf-pick a song),
-  `music album` / `music playlist` (pick and play whole), `music pause|next|prev`,
-  `music shuffle|repeat`, `music search <query>`.
+  `music queue <query>` (fzf multi-select songs to play next; bare `queue`
+  shows what's coming), `music album` / `music playlist` (pick and play
+  whole), `music pause|next|prev`, `music shuffle|repeat`, `music search`.
 
 ## Design stance
 
@@ -31,8 +32,11 @@ codes. The album art is the only full-color element on screen.
 
 - macOS only; drives Music.app (launches it if closed).
 - Library-only search — no Apple Music catalog (needs a paid developer token).
-- No Up Next manipulation (AppleScript barely exposes it). Albums play via a
-  throwaway `music-cli` playlist.
+- Music.app's real Up Next is not scriptable, so the queue is our own
+  `music-cli` scratch playlist (albums play through it too). Queueing while
+  playing from another context jumps into the scratch playlist at the same
+  position — near-seamless, but the old context's upcoming tracks are left
+  behind, and shuffle-on ignores queue order.
 
 ## Where it's headed (maybe)
 

@@ -8,6 +8,8 @@
 //
 // Usage: music                      the TUI (browser + player) — the main way
 //        music play [query]         pick a song and play it (no query: resume)
+//        music queue [query]        pick songs to play next (no query: show queue)
+//        music play -q <query>      same as music queue
 //        music album <query>        pick an album, play it in order
 //        music playlist <query>     pick a playlist, play it
 //        music search <query>       list matches without playing
@@ -133,6 +135,65 @@ function playTracksAsPlaylist(ids: string[], startId?: string) {
       : `pl.play();`}
     return "";
   `);
+}
+
+// Real Up Next is not scriptable (Apple never exposed it), so the queue is
+// our scratch playlist. Already playing from it: append. Playing anything
+// else: rebuild it as [current track, ...queued], jump in, and restore the
+// playback position — near-seamless, but the old context's upcoming tracks
+// are left behind (the one thing Music.app can't hide).
+function queueTracks(ids: string[]): { mode: string; shuffle: boolean } {
+  return jxa(`
+    const lib = music.libraryPlaylists[0];
+    const byId = (id) => { const f = lib.tracks.whose({ persistentID: id }); return f.length ? f[0] : null; };
+    const state = music.playerState();
+    const active = state === "playing" || state === "paused";
+    let currentId = "", pos = 0, inQueue = false;
+    try {
+      currentId = music.currentTrack.persistentID();
+      pos = music.playerPosition() || 0;
+      inQueue = music.currentPlaylist.name() === ${JSON.stringify(TEMP_PLAYLIST)};
+    } catch (e) {}
+    const shuffle = music.shuffleEnabled();
+    if (active && inQueue) {
+      const pl = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)});
+      for (const id of ${JSON.stringify(ids)}) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
+      return JSON.stringify({ mode: "appended", shuffle });
+    }
+    const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
+    while (old.length > 0) music.delete(old[0]);
+    const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
+    const all = active && currentId ? [currentId, ...${JSON.stringify(ids)}] : ${JSON.stringify(ids)};
+    for (const id of all) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
+    if (active && currentId) {
+      pl.tracks[0].play();
+      music.playerPosition = pos;
+      if (state === "paused") music.playpause();
+      return JSON.stringify({ mode: "switched", shuffle });
+    }
+    pl.play();
+    return JSON.stringify({ mode: "started", shuffle });
+  `);
+}
+
+function showQueue() {
+  const q = jxa(`
+    let names = [], artists = [], ids = [];
+    try {
+      const tr = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)}).tracks;
+      if (tr.length > 0) { names = tr.name(); artists = tr.artist(); ids = tr.persistentID(); }
+    } catch (e) {} // no queue playlist yet
+    let cur = "";
+    try { if (music.currentPlaylist.name() === ${JSON.stringify(TEMP_PLAYLIST)}) cur = music.currentTrack.persistentID(); } catch (e) {}
+    return JSON.stringify({ names, artists, ids, cur });
+  `);
+  if (q.ids.length === 0) { console.log("queue is empty — music queue <query>"); return; }
+  const curIdx = q.ids.indexOf(q.cur);
+  q.ids.forEach((_: string, i: number) => {
+    if (i === curIdx) console.log(`♪ ${q.names[i]}  ${DIM}${q.artists[i]}${RESET}`);
+    else if (curIdx >= 0 && i < curIdx) console.log(`${DIM}✓ ${q.names[i]}  ${q.artists[i]}${RESET}`);
+    else console.log(`  ${q.names[i]}  ${DIM}${q.artists[i]}${RESET}`);
+  });
 }
 
 // Command-line album play: no cache to hand, so resolve the album in JXA.
@@ -324,6 +385,24 @@ function pick(lines: string[], header: string): number | null {
   const answer = prompt(`${header} [1-${lines.length}]`);
   const n = answer ? parseInt(answer) : NaN;
   return n >= 1 && n <= lines.length ? n - 1 : null;
+}
+
+// Multi-select variant (fzf: tab marks several, enter confirms).
+function pickMany(lines: string[], header: string): number[] {
+  if (lines.length === 0) return [];
+  if (lines.length === 1) return [0];
+  const hasFzf = Bun.spawnSync(["which", "fzf"]).exitCode === 0;
+  if (hasFzf && process.stdin.isTTY) {
+    const input = lines.map((l, i) => `${i}\t${l}`).join("\n");
+    const res = Bun.spawnSync(
+      ["fzf", "--multi", "--reverse", "--height=~50%", "--delimiter=\t", "--with-nth=2..", `--header=${header} — tab selects several`],
+      { stdin: Buffer.from(input), stdout: "pipe", stderr: "inherit" },
+    );
+    if (res.exitCode !== 0) return [];
+    return res.stdout.toString().trim().split("\n").map((l) => parseInt(l));
+  }
+  const i = pick(lines, header); // ponytail: no-fzf fallback picks one at a time
+  return i === null ? [] : [i];
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +705,17 @@ function songLabel(s: Song): string {
   return `${s.name}  ${DIM}${s.artist} — ${s.album}${RESET}`;
 }
 
+function queueCmd(query: string) {
+  requireQuery(query, "usage: music queue <query>");
+  const songs = searchLibrary(query);
+  if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
+  const picked = pickMany(songs.map(songLabel), "queue");
+  if (picked.length === 0) return;
+  const { mode, shuffle } = queueTracks(picked.map((i) => songs[i].id));
+  console.log(`queued ${picked.length} song${picked.length === 1 ? "" : "s"}${mode === "started" ? " — playing" : ""}`);
+  if (shuffle) console.log(`${DIM}note: shuffle is on, so Music won't respect the queue order${RESET}`);
+}
+
 function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const query = rest.join(" ");
@@ -635,7 +725,13 @@ function main() {
       tui();
       return; // keeps the event loop alive
     }
+    case "queue": {
+      if (!query) { showQueue(); break; }
+      queueCmd(query);
+      break;
+    }
     case "play": {
+      if (rest[0] === "-q" || rest[0] === "--queue") { queueCmd(rest.slice(1).join(" ")); break; }
       if (!query) { jxa(`music.play(); return "";`); break; }
       const songs = searchLibrary(query);
       if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
@@ -694,7 +790,7 @@ function main() {
       break;
     }
     default:
-      console.error("usage: music [play|album|playlist|search|pause|next|prev|shuffle|repeat] [query]");
+      console.error("usage: music [play|queue|album|playlist|search|pause|next|prev|shuffle|repeat] [query]");
       process.exit(cmd ? 1 : 0);
   }
 }
