@@ -629,14 +629,17 @@ async function tui() {
       middle = { x: w + 1, y: 1, w, h: H };
       browse = { x: 2 * w + 1, y: 1, w: cols - 2 * w, h: H };
     } else if (rows >= 34) {
-      const h = Math.floor(H / 3);
-      player = { x: 1, y: 1, w: cols, h };
-      middle = { x: 1, y: h + 1, w: cols, h };
-      browse = { x: 1, y: 2 * h + 1, w: cols, h: H - 2 * h };
+      // Stacked: the player keeps its vertical art-on-top arrangement, so it
+      // gets the rows that needs (middle and browse split what remains).
+      const hp = H - 16; // leave ≥8 rows each for the other two panels
+      const hm = Math.floor((H - hp) / 2);
+      player = { x: 1, y: 1, w: cols, h: hp };
+      middle = { x: 1, y: hp + 1, w: cols, h: hm };
+      browse = { x: 1, y: hp + hm + 1, w: cols, h: H - hp - hm };
     } else if (rows >= 20) {
-      const h = Math.min(11, Math.floor(H / 2));
-      player = { x: 1, y: 1, w: cols, h };
-      browse = { x: 1, y: h + 1, w: cols, h: H - h };
+      const hp = H - 10; // browse keeps ≥10 rows
+      player = { x: 1, y: 1, w: cols, h: hp };
+      browse = { x: 1, y: hp + 1, w: cols, h: H - hp };
     } else {
       player = { x: 1, y: 1, w: Math.min(cols, 48), h: H };
     }
@@ -782,17 +785,9 @@ async function tui() {
     // ---- player panel
     {
       const r = player, inner = r.w - 2, x = r.x;
-      // Two arrangements: a tall column puts the art on top (scaling with
-      // the window, reserving rows for up-next when it can); a wide, short
-      // panel (stacked layout) puts the art left of the text so it survives
-      // any panel height.
-      const sideArt = r.w > r.h * 3;
-      let artA: number;
-      if (sideArt) {
-        artA = Math.min((r.h - 2) * 2, Math.floor(inner / 2));
-      } else {
-        artA = Math.min(inner - 6, Math.max(28, (r.h - 19) * 2), (r.h - 13) * 2);
-      }
+      // Art on top, scaling with the window — bounded by panel width and
+      // height, reserving rows for the up-next section when it can.
+      let artA = Math.min(inner - 6, Math.max(28, (r.h - 19) * 2), (r.h - 13) * 2);
       artA -= artA % 2;
       const showArt = !stopped && artA >= 8;
       const artH = showArt ? artA / 2 : 0;
@@ -803,9 +798,7 @@ async function tui() {
       if (newFrame && showArt) {
         const art = fetchArt(now.id);
         if (art) {
-          const ax = sideArt ? x + 2 : x + 1 + Math.floor((inner - artA) / 2);
-          const ay = sideArt ? r.y + 1 + Math.floor((r.h - 2 - artH) / 2) : r.y + 2;
-          drawArt(art.png, ax, ay, artA, artH);
+          drawArt(art.png, x + 1 + Math.floor((inner - artA) / 2), r.y + 2, artA, artH);
           const [rd, gn, bl] = liftAccent(art.accent);
           accent = `${ESC}38;2;${rd};${gn};${bl}m`;
         } else {
@@ -822,23 +815,6 @@ async function tui() {
       if (stopped) {
         const msg = "nothing playing";
         box(r.y + Math.floor(r.h / 2), DIM + msg + RESET, msg.length);
-      } else if (sideArt) {
-        // text block to the right of the art (rows are pre-blanked by panel())
-        const tx = x + 2 + (showArt ? artA + 2 : 0);
-        const tw = x + r.w - 2 - tx;
-        const put = (y: number, text: string) => at(tx, y, text);
-        put(r.y + 2, BOLD + clip(now.name, tw) + RESET);
-        put(r.y + 3, DIM + clip(`${now.artist} — ${now.album}`, tw) + RESET);
-        const parts = [now.genre, now.year ? `${now.year}` : "", now.plays ? `${now.plays} plays` : "", now.fav ? "♥" : ""]
-          .filter(Boolean);
-        put(r.y + 4, DIM + clip(parts.join(" · "), tw) + RESET);
-        const barW = tw - 1;
-        if (barW >= 8) {
-          put(r.y + 6, progressBar(now.pos, now.duration, barW, accent || BOLD, DIM, RESET));
-          const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
-          put(r.y + 7, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET);
-        }
-        if (statusItems.length > 0) put(r.y + r.h - 2, DIM + statusItems.join("   ") + RESET);
       } else {
         const infoY = r.y + (showArt ? artH + 3 : 2);
         const name = clip(now.name, inner - 2);
