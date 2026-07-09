@@ -21,7 +21,7 @@
 //           enter play · a add to queue · l open album/playlist · h back
 //           ␣ pause · ←/→ prev/next · +/- volume · s/r shuffle/repeat · q quit
 
-import { existsSync, mkdirSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 
 const CACHE = `${homedir()}/.cache/music-cli`; // per-track artwork + lyrics cache
@@ -71,6 +71,23 @@ export type Track = {
   albumArtist: string; disc: number; track: number; added: number;
 };
 
+// persistentID → database id, filled by loadLibrary/searchLibrary. Lets the
+// rebuild scripts resolve tracks with direct byId() lookups instead of
+// re-fetching the whole library on every queue operation.
+let dbidMap: Record<string, number> = {};
+
+// JXA snippet defining byPid(): map lookup first, whose() scan as fallback
+// for pids the map doesn't know (e.g. CLI runs with a partial map).
+function trackResolver(): string {
+  return `
+    const dbidByPid = ${JSON.stringify(dbidMap)};
+    const byPid = (pid) => {
+      const n = dbidByPid[pid];
+      if (n !== undefined) { try { const t = lib.tracks.byId(n); if (t) return t; } catch (e) {} }
+      try { const f = lib.tracks.whose({ persistentID: pid }); return f.length ? f[0] : null; } catch (e) { return null; }
+    };`;
+}
+
 // One bulk fetch per property: the whole library arrives in well under a
 // second, so the TUI never talks to Music.app while you type.
 function loadLibrary(): Track[] {
@@ -78,15 +95,19 @@ function loadLibrary(): Track[] {
     const tr = music.libraryPlaylists[0].tracks;
     const names = tr.name(), artists = tr.artist(), albums = tr.album(),
       albumArtists = tr.albumArtist(), ids = tr.persistentID(),
-      discs = tr.discNumber(), nums = tr.trackNumber(), added = tr.dateAdded();
+      discs = tr.discNumber(), nums = tr.trackNumber(), added = tr.dateAdded(),
+      dbids = tr.id();
     return JSON.stringify(names.map((n, i) => [ids[i], n, artists[i], albums[i],
-      albumArtists[i], discs[i], nums[i], added[i]]));
+      albumArtists[i], discs[i], nums[i], added[i], dbids[i]]));
   `);
-  return rows.map((r: any[]) => ({
-    id: r[0], name: r[1] || "", artist: r[2] || "", album: r[3] || "",
-    albumArtist: r[4] || "", disc: r[5] || 0, track: r[6] || 0,
-    added: r[7] ? Date.parse(r[7]) : 0,
-  }));
+  return rows.map((r: any[]) => {
+    dbidMap[r[0]] = r[8];
+    return {
+      id: r[0], name: r[1] || "", artist: r[2] || "", album: r[3] || "",
+      albumArtist: r[4] || "", disc: r[5] || 0, track: r[6] || 0,
+      added: r[7] ? Date.parse(r[7]) : 0,
+    };
+  });
 }
 
 function loadPlaylistNames(): string[] {
@@ -117,11 +138,14 @@ function searchLibrary(query: string): Song[] {
     for (const t of hits.slice(0, 100)) {
       // search can return dead references (tracks removed from the cloud
       // library); touching any property of one throws -1728. Skip them.
-      try { out.push({ id: t.persistentID(), name: t.name(), artist: t.artist(), album: t.album() }); }
+      try { out.push({ id: t.persistentID(), name: t.name(), artist: t.artist(), album: t.album(), db: t.id() }); }
       catch (e) {}
     }
     return JSON.stringify(out);
-  `);
+  `).map((s: any) => {
+    dbidMap[s.id] = s.db;
+    return { id: s.id, name: s.name, artist: s.artist, album: s.album };
+  });
 }
 
 // Music.app has no scriptable "play these tracks": the reliable trick is a
@@ -136,22 +160,20 @@ function playTracksAsPlaylist(ids: string[], startId?: string) {
   const list = ids.slice(start);
   jxaRetry(`
     const lib = music.libraryPlaylists[0];
-    // Two aligned bulk fetches, then byId() key lookups. NEVER index
-    // lib.tracks[i] against a bulk array — the orders don't match.
-    const pids = lib.tracks.persistentID();
-    const dbids = lib.tracks.id();
+    ${trackResolver()}
     const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
     while (old.length > 0) music.delete(old[0]);
     const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
     for (const id of ${JSON.stringify(list)}) {
-      const i = pids.indexOf(id);
-      if (i < 0) continue; // dead track
-      try { music.duplicate(lib.tracks.byId(dbids[i]), { to: pl }); } catch (e) {}
+      const t = byPid(id);
+      if (!t) continue; // dead track
+      try { music.duplicate(t, { to: pl }); } catch (e) {}
     }
     // already mutated: never throw past this point (see queueTracks)
     try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} }
     return "";
   `);
+  markOp(0); // rebuilds make Music's state reads stale for the next op
 }
 
 // Real Up Next is not scriptable (Apple never exposed it), so the queue is
@@ -159,16 +181,41 @@ function playTracksAsPlaylist(ids: string[], startId?: string) {
 // else: rebuild it as [current track, ...queued], jump in, and restore the
 // playback position — near-seamless, but the old context's upcoming tracks
 // are left behind (the one thing Music.app can't hide).
+// Rapid queue ops race each other's volume restore inside Music.app (the
+// second rebuild makes Music drop the first op's pending set, and volume
+// reads are stale). The last op's captured volume is remembered on disk so
+// the next op can re-assert it when its own read comes back 0.
+const LASTOP_FILE = `${CACHE}/lastop.json`;
+
+function lastOp(): { vol: number; t: number } {
+  try {
+    const saved = JSON.parse(readFileSync(LASTOP_FILE, "utf8"));
+    return { vol: saved.vol || 0, t: saved.t || 0 };
+  } catch (e) {
+    return { vol: 0, t: 0 };
+  }
+}
+
+// Record that a rebuild just ran (and the volume it saw), so the next op
+// can wait out Music's stale-read window and re-assert the volume.
+function markOp(vol: number) {
+  try {
+    mkdirSync(CACHE, { recursive: true });
+    writeFileSync(LASTOP_FILE, JSON.stringify({ vol: vol > 0 ? vol : lastOp().vol, t: Date.now() }));
+  } catch (e) {}
+}
+
 // replace=true swaps the entire upcoming list for `ids` (queue editing);
 // replace=false appends `ids` after whatever is already upcoming.
 function queueTracks(ids: string[], replace = false): { mode: string; shuffle: boolean } {
-  return jxaRetry(`
+  const prev = lastOp();
+  const soonAfterRebuild = Date.now() - prev.t < 1500;
+  const out = jxaRetry(`
+    // A rebuild just happened: player state reads (position, volume,
+    // current playlist) are stale for up to ~1s. Wait them out.
+    ${soonAfterRebuild ? "delay(0.7);" : ""}
     const lib = music.libraryPlaylists[0];
-    // Two aligned bulk fetches, then byId() key lookups. NEVER index
-    // lib.tracks[i] against a bulk array — the orders don't match.
-    const pids = lib.tracks.persistentID();
-    const dbids = lib.tracks.id();
-    const byId = (id) => { const i = pids.indexOf(id); return i >= 0 ? lib.tracks.byId(dbids[i]) : null; };
+    ${trackResolver()}
     const state = music.playerState();
     const active = state === "playing" || state === "paused";
     let currentId = "", pos = 0, inQueue = false;
@@ -202,7 +249,7 @@ function queueTracks(ids: string[], replace = false): { mode: string; shuffle: b
     while (old.length > 0) music.delete(old[0]);
     const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
     const all = active && currentId ? [currentId, ...leftover, ...${JSON.stringify(ids)}] : ${JSON.stringify(ids)};
-    for (const id of all) { const t = byId(id); if (t) music.duplicate(t, { to: pl }); }
+    for (const id of all) { const t = byPid(id); if (t) { try { music.duplicate(t, { to: pl }); } catch (e) {} } }
     // Everything below has already mutated the playlist, so it must never
     // throw — a script error here would make the caller's retry duplicate
     // the rebuild. Each step is best-effort.
@@ -210,8 +257,13 @@ function queueTracks(ids: string[], replace = false): { mode: string; shuffle: b
       // pl.play() restarts the current song from 0:00 before the seek lands,
       // which is audible. Mute for the jump, then keep re-seeking until the
       // position actually sticks and unmute the instant it does.
-      let vol = 100;
-      try { vol = music.soundVolume(); music.soundVolume = 0; } catch (e) {}
+      // Volume reads are stale for ~300ms after a set — right after another
+      // queue op, soundVolume() can report the previous op's mute (0). Fall
+      // back to the recently remembered volume so this op re-asserts it.
+      let vol = 0;
+      try { vol = music.soundVolume() || 0; } catch (e) {}
+      if (vol === 0) vol = ${Date.now() - prev.t < 30000 ? prev.vol : 0};
+      if (vol > 0) { try { music.soundVolume = 0; } catch (e) {} }
       try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} } // the only call that adopts the playlist as context
       try {
         for (let i = 0; i < 20; i++) {
@@ -221,12 +273,24 @@ function queueTracks(ids: string[], replace = false): { mode: string; shuffle: b
         }
       } catch (e) {}
       try { if (state === "paused") music.playpause(); } catch (e) {}
-      try { music.soundVolume = vol; } catch (e) {}
-      return JSON.stringify({ mode: "switched", shuffle });
+      // Music drops volume sets issued while a track is still loading —
+      // keep asserting until the read agrees.
+      if (vol > 0) {
+        try {
+          for (let i = 0; i < 10; i++) {
+            music.soundVolume = vol;
+            if ((music.soundVolume() || 0) === vol) break;
+            delay(0.1);
+          }
+        } catch (e) {}
+      }
+      return JSON.stringify({ mode: "switched", shuffle, vol });
     }
     try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} }
-    return JSON.stringify({ mode: "started", shuffle });
+    return JSON.stringify({ mode: "started", shuffle, vol: 0 });
   `);
+  markOp(out ? out.vol : 0);
+  return out;
 }
 
 function showQueue() {
