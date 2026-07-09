@@ -48,17 +48,28 @@ type Song = { id: string; name: string; artist: string; album: string };
 function searchLibrary(query: string): Song[] {
   return jxa(`
     const hits = music.search(music.libraryPlaylists[0], { for: ${JSON.stringify(query)} });
-    return JSON.stringify(hits.slice(0, 100).map(t => ({
-      id: t.persistentID(), name: t.name(), artist: t.artist(), album: t.album(),
-    })));
+    const out = [];
+    for (const t of hits.slice(0, 100)) {
+      // search can return dead references (tracks removed from the cloud
+      // library); touching any property of one throws -1728. Skip them.
+      try { out.push({ id: t.persistentID(), name: t.name(), artist: t.artist(), album: t.album() }); }
+      catch (e) {}
+    }
+    return JSON.stringify(out);
   `);
 }
 
 function playSongById(id: string) {
-  jxa(`
-    music.libraryPlaylists[0].tracks.whose({ persistentID: ${JSON.stringify(id)} })[0].play();
-    return "";
+  const ok = jxa(`
+    const found = music.libraryPlaylists[0].tracks.whose({ persistentID: ${JSON.stringify(id)} });
+    if (found.length === 0) return JSON.stringify(false);
+    found[0].play();
+    return JSON.stringify(true);
   `);
+  if (!ok) {
+    console.error("that track has vanished from the library");
+    process.exit(1);
+  }
 }
 
 // Music.app has no scriptable "play these tracks": the reliable trick is a
@@ -68,13 +79,17 @@ function playAlbum(album: string) {
   jxa(`
     const lib = music.libraryPlaylists[0];
     const spec = lib.tracks.whose({ album: ${JSON.stringify(album)} });
-    const discs = spec.discNumber(), nums = spec.trackNumber();
+    let discs = [], nums = [];
+    try { discs = spec.discNumber(); nums = spec.trackNumber(); }
+    catch (e) { discs = new Array(spec.length).fill(0); nums = discs; } // dead reference in album: keep library order
     const order = discs.map((d, i) => i);
     order.sort((a, b) => (discs[a] - discs[b]) || (nums[a] - nums[b]));
     const old = music.userPlaylists.whose({ name: "music-cli" });
     while (old.length > 0) music.delete(old[0]);
     const pl = music.make({ new: "playlist", withProperties: { name: "music-cli" } });
-    for (const i of order) music.duplicate(spec[i], { to: pl });
+    for (const i of order) {
+      try { music.duplicate(spec[i], { to: pl }); } catch (e) {} // skip dead tracks
+    }
     pl.play();
     return "";
   `);
