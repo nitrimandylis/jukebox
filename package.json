@@ -1,11 +1,11 @@
 {
-  "name": "music-cli",
+  "name": "jukebox",
   "version": "0.1.0",
   "private": true,
   "bin": {
-    "music": "./music.ts"
+    "juke": "./jukebox.ts"
   },
   "scripts": {
-    "compile": "bun build --compile music.ts --outfile ~/.bun/bin/music"
+    "compile": "bun build --compile jukebox.ts --outfile ~/.bun/bin/juke"
   }
 }

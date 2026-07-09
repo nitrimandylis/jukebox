@@ -1,19 +1,19 @@
 import { expect, test } from "bun:test";
-import { fmtTime, progressBar, bmpPixel, liftAccent, matches, groupAlbums, type Track } from "./music.ts";
+import { fmtTime, progressBar, bmpPixel, liftAccent, matches, groupAlbums, type Track } from "./jukebox.ts";
 
 const track = (over: Partial<Track>): Track => ({
   id: "X", name: "", artist: "", album: "", albumArtist: "", disc: 1, track: 1, added: 0, ...over,
 });
 
 test("splitKeys separates batched input, keeps escape sequences whole", () => {
-  const { splitKeys } = require("./music.ts");
+  const { splitKeys } = require("./jukebox.ts");
   expect(splitKeys("/gnx")).toEqual(["/", "g", "n", "x"]);
   expect(splitKeys("\x1b[A\x1b[Bj")).toEqual(["\x1b[A", "\x1b[B", "j"]);
   expect(splitKeys("\x1b")).toEqual(["\x1b"]); // lone esc
 });
 
 test("parseLyrics handles synced LRC, plain text, and nothing", () => {
-  const { parseLyrics } = require("./music.ts");
+  const { parseLyrics } = require("./jukebox.ts");
   const lrc = "[00:12.34] first line\n[01:02.5]second\nnot a timestamp";
   expect(parseLyrics(lrc, null)).toEqual([
     { t: 12.34, text: "first line" },
@@ -27,14 +27,14 @@ test("parseLyrics handles synced LRC, plain text, and nothing", () => {
 });
 
 test("wrapText wraps at word boundaries", () => {
-  const { wrapText } = require("./music.ts");
+  const { wrapText } = require("./jukebox.ts");
   expect(wrapText("the quick brown fox", 10)).toEqual(["the quick", "brown fox"]);
   expect(wrapText("", 10)).toEqual([""]);
   expect(wrapText("short", 10)).toEqual(["short"]);
 });
 
 test("groupArtists sorts tracks by album/disc/track, artists newest-first", () => {
-  const { groupArtists } = require("./music.ts");
+  const { groupArtists } = require("./jukebox.ts");
   const artists = groupArtists([
     track({ id: "b2", artist: "Old Guy", album: "B", track: 2, added: 10 }),
     track({ id: "b1", artist: "Old Guy", album: "B", track: 1, added: 5 }),

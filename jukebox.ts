@@ -1,21 +1,21 @@
 #!/usr/bin/env bun
-// music — Apple Music for the terminal.
+// juke — Apple Music for the terminal (the jukebox project).
 // Music.app does the playing (its library is DRM'd, so nothing else can);
 // this CLI is the remote control and the pretty face. Data flows over
 // osascript: JXA for queries, AppleScript for the artwork dump. Album art
 // renders as real pixels via the Kitty graphics protocol (Ghostty, kitty,
 // WezTerm); everything else inherits the terminal's own theme.
 //
-// Usage: music                      the TUI (browser + player) — the main way
-//        music play [query]         pick a song and play it (no query: resume)
-//        music queue [query]        pick songs to play next (no query: show queue)
-//        music play -q <query>      same as music queue
-//        music album <query>        pick an album, play it in order
-//        music artist <query>       pick an artist, play everything by them
-//        music playlist <query>     pick a playlist, play it
-//        music search <query>       list matches without playing
-//        music pause | next | prev  transport
-//        music shuffle | repeat     toggle / cycle
+// Usage: juke                      the TUI (browser + player) — the main way
+//        juke play [query]         pick a song and play it (no query: resume)
+//        juke queue [query]        pick songs to play next (no query: show queue)
+//        juke play -q <query>      same as juke queue
+//        juke album <query>        pick an album, play it in order
+//        juke artist <query>       pick an artist, play everything by them
+//        juke playlist <query>     pick a playlist, play it
+//        juke search <query>       list matches without playing
+//        juke pause | next | prev  transport
+//        juke shuffle | repeat     toggle / cycle
 //
 // TUI keys: j/k move · 1/2/3 switch tabs · ⇥ preview/lyrics · / filter
 //           enter play · a add to queue · l open album/playlist · h back
@@ -24,8 +24,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 
-const CACHE = `${homedir()}/.cache/music-cli`; // per-track artwork + lyrics cache
-const TEMP_PLAYLIST = "music-cli"; // scratch playlist for album playback
+const CACHE = `${homedir()}/.cache/jukebox`; // per-track artwork + lyrics cache
+const TEMP_PLAYLIST = "jukebox"; // scratch playlist for album playback
 
 // ---------------------------------------------------------------------------
 // Talking to Music.app
@@ -304,7 +304,7 @@ function showQueue() {
     try { if (music.currentPlaylist.name() === ${JSON.stringify(TEMP_PLAYLIST)}) cur = music.currentTrack.persistentID(); } catch (e) {}
     return JSON.stringify({ names, artists, ids, cur });
   `);
-  if (q.ids.length === 0) { console.log("queue is empty — music queue <query>"); return; }
+  if (q.ids.length === 0) { console.log("queue is empty — juke queue <query>"); return; }
   const curIdx = q.ids.indexOf(q.cur);
   q.ids.forEach((_: string, i: number) => {
     if (i === curIdx) console.log(`♪ ${q.names[i]}  ${DIM}${q.artists[i]}${RESET}`);
@@ -484,7 +484,7 @@ async function fetchLyrics(now: Now): Promise<LyricLine[]> {
   const cache = `${CACHE}/${safe}.lyrics.json`;
   if (existsSync(cache)) return JSON.parse(readFileSync(cache, "utf8"));
   mkdirSync(CACHE, { recursive: true });
-  const headers = { "User-Agent": "music-cli (terminal Apple Music player)" };
+  const headers = { "User-Agent": "jukebox (terminal Apple Music player)" };
   let lines: LyricLine[] = [];
   let definitive = true; // only cache real answers, not network failures
   try {
@@ -512,7 +512,7 @@ async function fetchLyrics(now: Now): Promise<LyricLine[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Pure helpers (tested in music.test.ts)
+// Pure helpers (tested in jukebox.test.ts)
 
 export function fmtTime(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
@@ -659,7 +659,7 @@ const TABS = ["songs", "albums", "playlists", "artists"] as const;
 
 async function tui() {
   if (!process.stdout.isTTY) {
-    console.error("the TUI needs a terminal; try `music search <query>`");
+    console.error("the TUI needs a terminal; try `juke search <query>`");
     process.exit(1);
   }
 
@@ -1282,9 +1282,9 @@ function requireQuery(query: string, usage: string): string {
   return query;
 }
 
-const HELP = `music — Apple Music for the terminal
+const HELP = `juke — Apple Music for the terminal
 
-usage: music [command] [query]
+usage: juke [command] [query]
 
 commands:
   (none)            open the TUI
@@ -1317,7 +1317,7 @@ function songLabel(s: Song): string {
 }
 
 function queueCmd(query: string) {
-  requireQuery(query, "usage: music queue <query>");
+  requireQuery(query, "usage: juke queue <query>");
   const songs = searchLibrary(query);
   if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
   const picked = pickMany(songs.map(songLabel), "queue");
@@ -1353,7 +1353,7 @@ function main() {
       break;
     }
     case "album": {
-      requireQuery(query, "usage: music album <query>");
+      requireQuery(query, "usage: juke album <query>");
       const q = query.toLowerCase();
       const albums = [...new Set(searchLibrary(query).map((s) => s.album))]
         .filter((a) => a.toLowerCase().includes(q));
@@ -1365,7 +1365,7 @@ function main() {
       break;
     }
     case "artist": {
-      requireQuery(query, "usage: music artist <query>");
+      requireQuery(query, "usage: juke artist <query>");
       const q = query.toLowerCase();
       const names = [...new Set(searchLibrary(query).map((s) => s.artist))]
         .filter((a) => a.toLowerCase().includes(q));
@@ -1377,7 +1377,7 @@ function main() {
       break;
     }
     case "playlist": {
-      requireQuery(query, "usage: music playlist <query>");
+      requireQuery(query, "usage: juke playlist <query>");
       const q = query.toLowerCase();
       const names: string[] = loadPlaylistNames().filter((n: string) => n.toLowerCase().includes(q));
       if (names.length === 0) { console.error(`no playlist matches "${query}"`); process.exit(1); }
@@ -1388,7 +1388,7 @@ function main() {
       break;
     }
     case "search": {
-      requireQuery(query, "usage: music search <query>");
+      requireQuery(query, "usage: juke search <query>");
       const songs = searchLibrary(query);
       if (songs.length === 0) { console.log("no matches"); return; }
       for (const s of songs) console.log(songLabel(s));
@@ -1413,8 +1413,8 @@ function main() {
       console.log(HELP);
       break;
     default:
-      console.error(`music: unknown command '${cmd}'`);
-      console.error("try 'music --help'");
+      console.error(`juke: unknown command '${cmd}'`);
+      console.error("try 'juke --help'");
       process.exit(1);
   }
 }
