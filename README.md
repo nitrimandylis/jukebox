@@ -50,8 +50,9 @@ You need macOS, [Bun](https://bun.sh), Music.app with a library in it, and a ter
 ```bash
 git clone https://github.com/nitrimandylis/jukebox.git
 cd jukebox
-bun run compile   # → ~/.bun/bin/juke
+bun run compile   # → ~/.bun/bin/juke, and man juke into your manpath
 juke
+man juke          # the full command + TUI-key reference, offline
 ```
 
 First run, macOS will ask whether the terminal may control Music. Say yes — that permission *is* the architecture.
