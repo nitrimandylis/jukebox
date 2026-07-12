@@ -1,0 +1,94 @@
+.TH JUKE 1 "2026-07-12" "jukebox 0.1.0" "User Commands"
+.SH NAME
+juke \- Apple Music for the terminal
+.SH SYNOPSIS
+.B juke
+[\fIcommand\fR] [\fIquery\fR]
+.SH DESCRIPTION
+A three-panel TUI remote control for Music.app on macOS. Music.app keeps doing
+the playing; juke drives it over
+.BR osascript ,
+renders cover art as real pixels via the Kitty graphics protocol, and pulls
+time-synced lyrics from lrclib.net. Run with no command to open the TUI.
+.SH COMMANDS
+.TP
+.B play [\fIquery\fR]
+Pick a song and play it. With no query, resume playback.
+.TP
+.B queue [\fIquery\fR]
+Pick songs to play next. With no query, show the queue.
+.TP
+.B play \-q <\fIquery\fR>
+Same as
+.BR queue .
+.TP
+.B album <\fIquery\fR>
+Pick an album, play it in order.
+.TP
+.B artist <\fIquery\fR>
+Pick an artist, play everything by them.
+.TP
+.B playlist <\fIquery\fR>
+Pick a playlist, play it.
+.TP
+.B search <\fIquery\fR>
+List matching songs without playing.
+.TP
+.B pause
+Toggle play/pause.
+.TP
+.B next\fR, \fBprev
+Skip to the next / previous track.
+.TP
+.B shuffle
+Toggle shuffle.
+.TP
+.B repeat
+Cycle repeat (off \(-> all \(-> one).
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH TUI KEYS
+.B j/k
+or arrows move,
+.B enter
+play,
+.B l
+open album/playlist,
+.B h
+back,
+.B a
+add to queue,
+.B 1\-4
+switch tabs,
+.B tab
+cycles preview/lyrics/queue.
+In the queue view:
+.B enter
+play,
+.B x
+remove,
+.B J/K
+reorder.
+.B /
+filter,
+.B esc
+clear,
+.B space
+pause,
+.B \(<-/\(->
+prev/next,
+.B +/\-
+volume,
+.B s
+shuffle,
+.B r
+repeat,
+.B q
+quit.
+.SH NOTES
+Lyrics come from lrclib.net (sends title/artist/duration when the lyrics view
+is open). macOS only.
+.SH SEE ALSO
+.BR osascript (1)
