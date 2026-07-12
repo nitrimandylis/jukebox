@@ -16,7 +16,9 @@ time-synced lyrics from lrclib.net. Run with no command to open the TUI.
 Pick a song and play it. With no query, resume playback.
 .TP
 .B queue [\fIquery\fR]
-Pick songs to play next. With no query, show the queue.
+Pick songs to play next — appended to juke's own queue (see
+.BR QUEUE ).
+With no query, show the queue.
 .TP
 .B play \-q <\fIquery\fR>
 Same as
@@ -38,7 +40,8 @@ List matching songs without playing.
 Toggle play/pause.
 .TP
 .B next\fR, \fBprev
-Skip to the next / previous track.
+Skip to the next / previous track. Walks juke's queue when one is active,
+Music's own transport otherwise.
 .TP
 .B shuffle
 Toggle shuffle.
@@ -87,6 +90,25 @@ shuffle,
 repeat,
 .B q
 quit.
+.SH QUEUE
+Music.app never exposed its real Up Next to scripting, so juke keeps its own:
+.I ~/.cache/jukebox/queue.json
+plus a detached watcher process (spawned automatically by any play or queue
+operation) that starts the next queued track just before the current one
+ends. The queue survives closing the terminal; the watcher exits when the
+queue runs out, or stands down if you start playing something else yourself.
+Playlists picked with
+.B juke playlist
+play natively through Music.app instead.
+.PP
+Trade-offs: no gapless playback between queued tracks, and Music's
+shuffle/repeat settings do not apply to the queue \(em it always plays in
+order.
+.SH FILES
+.TP
+.I ~/.cache/jukebox/
+Cover art, lyrics, the queue file, and the watcher pidfile. Regenerable;
+safe to delete.
 .SH NOTES
 Lyrics come from lrclib.net (sends title/artist/duration when the lyrics view
 is open). macOS only.

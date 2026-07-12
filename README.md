@@ -66,12 +66,17 @@ flowchart LR
     C -->|kitty graphics| A
     A -->|title · artist · duration| D[lrclib.net]
     D -->|synced lyrics| E[~/.cache/jukebox]
+    A -->|play / queue| F[queue.json]
+    F --> G[watcher process]
+    G -->|next track, just before the end| B
 ```
 
 | layer | path | job |
 |---|---|---|
 | everything | `jukebox.ts` | the TUI, the commands, the Music.app diplomacy — one file, raw escape codes, no TUI framework |
-| checks | `jukebox.test.ts` | the pure logic (time, wrapping, grouping, LRC parsing) — `bun test` |
+| the queue | `~/.cache/jukebox/queue.json` | what plays next, as JSON — every edit is a file write, nothing touches Music.app |
+| the watcher | `juke watch` (spawned for you) | a detached loop that polls Music and starts the next queued track just before the current one ends — exits when the queue does, or when you take over |
+| checks | `jukebox.test.ts` | the pure logic (time, wrapping, grouping, LRC parsing, queue edits) — `bun test` |
 | product notes | `PRODUCT.md` | what this is and the Music.app scripting landmines, documented so nobody steps on them twice |
 | cache | `~/.cache/jukebox` | covers, accent pixels, lyrics — regenerable, survives reboots |
 
