@@ -45,8 +45,9 @@ codes. The album art is the only full-color element on screen.
 
 - macOS only; drives Music.app (launches it if closed).
 - Library-only search — no Apple Music catalog (needs a paid developer token).
-- Music.app's real Up Next is not scriptable, so the queue is our own
-  `jukebox` scratch playlist (albums play through it too). Queueing while
-  playing from another context jumps into the scratch playlist at the same
-  position — near-seamless, but the old context's upcoming tracks are left
-  behind, and shuffle-on ignores queue order.
+- Music.app's real Up Next is not scriptable, so the queue is our own: a
+  JSON file (`~/.cache/jukebox/queue.json`) plus a detached watcher process
+  that plays the next track just before the current one ends (albums and
+  artists play through it too; real playlists play natively). No playlist
+  clutter in Music.app anymore — the trade is no gapless playback across
+  queued tracks, and Music's shuffle/repeat don't apply to the file queue.

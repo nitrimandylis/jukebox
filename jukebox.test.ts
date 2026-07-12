@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
-import { fmtTime, progressBar, bmpPixel, liftAccent, matches, groupAlbums, type Track } from "./jukebox.ts";
+import {
+  fmtTime, progressBar, bmpPixel, liftAccent, matches, groupAlbums,
+  upNext, removeUpcoming, moveUpcoming, type Track, type Queue,
+} from "./jukebox.ts";
 
 const track = (over: Partial<Track>): Track => ({
   id: "X", name: "", artist: "", album: "", albumArtist: "", disc: 1, track: 1, added: 0, ...over,
@@ -94,4 +97,31 @@ test("bmpPixel reads BGR at the header offset", () => {
 test("liftAccent brightens dark colors, leaves bright ones alone", () => {
   expect(Math.max(...liftAccent([30, 20, 10]))).toBe(150);
   expect(liftAccent([200, 100, 50])).toEqual([200, 100, 50]);
+});
+
+// --- queue file ops: `i` always indexes the upcoming list, not tracks
+
+const queue = (ids: string[], pos: number): Queue => ({
+  tracks: ids.map((id) => ({ id, name: id, artist: "" })),
+  pos,
+});
+const ids = (q: Queue) => q.tracks.map((t) => t.id);
+
+test("upNext is everything after pos — the whole queue when pos is -1", () => {
+  expect(upNext(queue(["a", "b", "c"], 0)).map((t) => t.id)).toEqual(["b", "c"]);
+  expect(upNext(queue(["a", "b", "c"], 2))).toEqual([]);
+  expect(upNext(queue(["a", "b"], -1)).map((t) => t.id)).toEqual(["a", "b"]);
+});
+
+test("removeUpcoming deletes by upcoming index, keeps pos and history", () => {
+  expect(ids(removeUpcoming(queue(["a", "b", "c"], 0), 1))).toEqual(["a", "b"]);
+  expect(removeUpcoming(queue(["a", "b", "c"], 1), 0).pos).toBe(1);
+  expect(ids(removeUpcoming(queue(["a", "b"], -1), 0))).toEqual(["b"]);
+});
+
+test("moveUpcoming swaps neighbours, refuses to leave the upcoming list", () => {
+  expect(ids(moveUpcoming(queue(["a", "b", "c"], 0), 0, 1)!)).toEqual(["a", "c", "b"]);
+  expect(moveUpcoming(queue(["a", "b", "c"], 0), 1, 1)).toBeNull(); // off the end
+  expect(moveUpcoming(queue(["a", "b", "c"], 0), 0, -1)).toBeNull(); // into the played part
+  expect(ids(moveUpcoming(queue(["a", "b"], -1), 0, 1)!)).toEqual(["b", "a"]);
 });

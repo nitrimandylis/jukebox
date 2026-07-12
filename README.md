@@ -22,7 +22,7 @@
 
 Apple Music has no real terminal client — the existing TUIs either target other streaming services or fight Music.app and lose. jukebox doesn't fight it. Music.app keeps doing the playing (its library is DRM'd, nothing else *can* play it), and jukebox becomes the remote control: a lazygit-style three-panel TUI that talks to Music over `osascript`, renders the album cover as actual pixels through the Kitty graphics protocol, and pulls time-synced lyrics from lrclib.net.
 
-The whole library loads in one bulk fetch at startup (~0.2s for ~1700 tracks), so browsing and filtering never talk to Music.app while you type. The queue deserves a footnote: Apple never exposed Up Next to scripting, so jukebox maintains its own through a scratch playlist it rebuilds on every edit — reverse-engineering around Music.app's snapshot behavior, stale reads, and dropped volume events is where most of the git history went.
+The whole library loads in one bulk fetch at startup (~0.2s for ~1700 tracks), so browsing and filtering never talk to Music.app while you type. The queue deserves a footnote: Apple never exposed Up Next to scripting, so jukebox maintains its own — a queue file on disk plus a small detached watcher process that starts the next track just before the current one ends. No scratch playlists cluttering Music.app (or syncing to your phone), and queue edits are just file writes.
 
 One file, no runtime dependencies, inherits your terminal theme. The only full-color element on screen is the cover art, which is how a music player should dress.
 
@@ -39,7 +39,7 @@ nick@jukebox:~$ juke play "not like us"
 | 01 | **player panel** | what it actually shows: cover art as real pixels (kitty graphics, quadrant-free), progress bar tinted with the cover's dominant color, genre · year · plays · ♥, and up next |
 | 02 | **browser** | songs / albums / playlists / artists tabs (`1-4`), newest first, `/` filters locally and instantly — one bulk fetch at startup, zero apple events per keystroke |
 | 03 | **preview** | lazygit's signature move — hover an album, playlist, or artist and see inside before committing. `l` drills in, enter plays from that exact track |
-| 04 | **queue** | `a` adds the hovered thing, the queue view (`⇥`) has its own cursor: enter jumps, `x` removes, `J/K` reorder — all via a scratch playlist, because apple's real up next is scripting-proof |
+| 04 | **queue** | `a` adds the hovered thing, the queue view (`⇥`) has its own cursor: enter jumps, `x` removes, `J/K` reorder — all plain file edits, because apple's real up next is scripting-proof |
 | 05 | **lyrics** | time-synced from lrclib.net (keyless), current line highlighted and auto-scrolled, cached in `~/.cache/jukebox` — music.app never shares its own |
 | 06 | **quick commands** | `juke play/queue/album/artist/playlist/search` with fzf picking (multi-select for queue) — the extras, for when the TUI is overkill |
 

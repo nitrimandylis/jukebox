@@ -21,11 +21,11 @@
 //           enter play · a add to queue · l open album/playlist · h back
 //           ␣ pause · ←/→ prev/next · +/- volume · s/r shuffle/repeat · q quit
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 
-const CACHE = `${homedir()}/.cache/jukebox`; // per-track artwork + lyrics cache
-const TEMP_PLAYLIST = "jukebox"; // scratch playlist for album playback
+const CACHE = `${homedir()}/.cache/jukebox`; // artwork + lyrics cache, queue file
+const TEMP_PLAYLIST = "jukebox"; // legacy scratch playlist — the watcher deletes it on sight
 
 // ---------------------------------------------------------------------------
 // Talking to Music.app
@@ -51,19 +51,14 @@ function jxa(body: string): any {
   return out ? JSON.parse(out) : null;
 }
 
-// Like jxa, but retries: Music.app throws transient errors (-1708) when a
-// playlist rebuild lands while it's still settling from the previous one.
-function jxaRetry(body: string, attempts = 3): any {
+// Like jxa, but returns null on error instead of exiting — the watcher runs
+// unattended and must shrug off Music.app's transient errors.
+function jxaQuiet(body: string): any {
   const script = `(function () { const music = Application("Music"); ${body} })()`;
-  for (let i = 1; i < attempts; i++) {
-    const res = Bun.spawnSync(["osascript", "-l", "JavaScript", "-e", script], { stderr: "pipe" });
-    if (res.exitCode === 0) {
-      const out = res.stdout.toString().trim();
-      return out ? JSON.parse(out) : null;
-    }
-    Bun.sleepSync(400);
-  }
-  return jxa(body); // last attempt reports the error for real
+  const res = Bun.spawnSync(["osascript", "-l", "JavaScript", "-e", script], { stderr: "pipe" });
+  if (res.exitCode !== 0) return null;
+  const out = res.stdout.toString().trim();
+  return out ? JSON.parse(out) : null;
 }
 
 export type Track = {
@@ -71,21 +66,14 @@ export type Track = {
   albumArtist: string; disc: number; track: number; added: number;
 };
 
-// persistentID → database id, filled by loadLibrary/searchLibrary. Lets the
-// rebuild scripts resolve tracks with direct byId() lookups instead of
-// re-fetching the whole library on every queue operation.
+// persistentID → database id, filled by loadLibrary/searchLibrary. Stored
+// into the queue file so playback resolves tracks with direct byId()
+// lookups instead of a whose() scan.
 let dbidMap: Record<string, number> = {};
 
-// JXA snippet defining byPid(): map lookup first, whose() scan as fallback
-// for pids the map doesn't know (e.g. CLI runs with a partial map).
-function trackResolver(): string {
-  return `
-    const dbidByPid = ${JSON.stringify(dbidMap)};
-    const byPid = (pid) => {
-      const n = dbidByPid[pid];
-      if (n !== undefined) { try { const t = lib.tracks.byId(n); if (t) return t; } catch (e) {} }
-      try { const f = lib.tracks.whose({ persistentID: pid }); return f.length ? f[0] : null; } catch (e) { return null; }
-    };`;
+// Track/Song → what the queue file stores.
+function qt(t: { id: string; name: string; artist: string }): QueueTrack {
+  return { id: t.id, db: dbidMap[t.id], name: t.name, artist: t.artist };
 }
 
 // One bulk fetch per property: the whole library arrives in well under a
@@ -148,215 +136,275 @@ function searchLibrary(query: string): Song[] {
   });
 }
 
-// Music.app has no scriptable "play these tracks": the reliable trick is a
-// throwaway playlist. Playing an individual track object NEVER adopts the
-// playlist as the play context (verified: context stays wherever it was) —
-// worse, Music then *reports* some arbitrary playlist containing the track
-// as currentPlaylist without ever intending to continue through it. So
-// every play, even a single song, goes through the scratch playlist and
-// pl.play() — to start mid-list, build the playlist from that track onward.
-function playTracksAsPlaylist(ids: string[], startId?: string) {
-  const start = startId ? Math.max(0, ids.indexOf(startId)) : 0;
-  const list = ids.slice(start);
-  jxaRetry(`
-    const lib = music.libraryPlaylists[0];
-    ${trackResolver()}
-    const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
-    while (old.length > 0) music.delete(old[0]);
-    const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
-    for (const id of ${JSON.stringify(list)}) {
-      const t = byPid(id);
-      if (!t) continue; // dead track
-      try { music.duplicate(t, { to: pl }); } catch (e) {}
-    }
-    // already mutated: never throw past this point (see queueTracks)
-    try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} }
-    return "";
-  `);
-  markOp(0); // rebuilds make Music's state reads stale for the next op
+// ---------------------------------------------------------------------------
+// The queue: a JSON file, not a Music.app playlist. Music only auto-advances
+// inside a playlist context, and a scratch playlist syncs to every device
+// via iCloud — clutter. So the queue lives in queue.json and a detached
+// watcher process (hidden `juke watch` command) plays the next track when
+// the current one ends. Real user playlists still play natively.
+// ponytail: no gapless playback across queued tracks — the watcher preempts
+// just before a track ends.
+
+export type QueueTrack = { id: string; db?: number; name: string; artist: string };
+// tracks[pos] is playing; pos -1 means the queue waits behind a foreign
+// track (something we didn't start) and begins when it ends.
+export type Queue = { tracks: QueueTrack[]; pos: number };
+
+const QUEUE_FILE = `${CACHE}/queue.json`;
+const PID_FILE = `${CACHE}/watcher.pid`;
+
+function readQueue(): Queue | null {
+  try {
+    const q = JSON.parse(readFileSync(QUEUE_FILE, "utf8"));
+    if (Array.isArray(q.tracks) && q.tracks.length > 0) return q;
+  } catch (e) {} // no queue
+  return null;
 }
 
-// Real Up Next is not scriptable (Apple never exposed it), so the queue is
-// our scratch playlist. Already playing from it: append. Playing anything
-// else: rebuild it as [current track, ...queued], jump in, and restore the
-// playback position — near-seamless, but the old context's upcoming tracks
-// are left behind (the one thing Music.app can't hide).
-// Rapid queue ops race each other's volume restore inside Music.app (the
-// second rebuild makes Music drop the first op's pending set, and volume
-// reads are stale). The last op's captured volume is remembered on disk so
-// the next op can re-assert it when its own read comes back 0.
-const LASTOP_FILE = `${CACHE}/lastop.json`;
+function writeQueue(q: Queue | null) {
+  if (!q || q.tracks.length === 0) {
+    try { unlinkSync(QUEUE_FILE); } catch (e) {}
+    return;
+  }
+  mkdirSync(CACHE, { recursive: true });
+  writeFileSync(QUEUE_FILE, JSON.stringify(q));
+}
 
-function lastOp(): { vol: number; t: number } {
+// Pure queue edits (tested in jukebox.test.ts). `i` indexes into upNext(q):
+// the upcoming list starts at tracks[pos + 1] — or tracks[0] when pos is -1.
+export function upNext(q: Queue): QueueTrack[] {
+  return q.tracks.slice(q.pos + 1);
+}
+
+export function removeUpcoming(q: Queue, i: number): Queue {
+  const tracks = [...q.tracks];
+  tracks.splice(q.pos + 1 + i, 1);
+  return { tracks, pos: q.pos };
+}
+
+export function moveUpcoming(q: Queue, i: number, d: number): Queue | null {
+  const j = i + d;
+  const len = upNext(q).length;
+  if (i < 0 || i >= len || j < 0 || j >= len) return null;
+  const tracks = [...q.tracks];
+  const a = q.pos + 1 + i, b = q.pos + 1 + j;
+  [tracks[a], tracks[b]] = [tracks[b], tracks[a]];
+  return { tracks, pos: q.pos };
+}
+
+// Play one track directly — no playlist, no context. Music never adopts a
+// context from this, which is exactly what we want: the watcher decides
+// what plays next. Cold-started Music swallows the first play; retry once.
+function playSnippet(t: QueueTrack): string {
+  return `
+    const lib = music.libraryPlaylists[0];
+    let tr = null;
+    ${t.db ? `try { tr = lib.tracks.byId(${t.db}); tr.name(); } catch (e) { tr = null; }` : ""}
+    if (!tr) { try { const f = lib.tracks.whose({ persistentID: ${JSON.stringify(t.id)} }); tr = f.length ? f[0] : null; } catch (e) {} }
+    if (tr) {
+      try { music.play(tr); } catch (e) {}
+      delay(0.3);
+      if (music.playerState() !== "playing") { try { music.play(tr); } catch (e) {} }
+    }
+  `;
+}
+
+function playTrack(t: QueueTrack, quiet = false) {
+  (quiet ? jxaQuiet : jxa)(playSnippet(t) + `return "";`);
+}
+
+// Spawn the watcher if one isn't already running. Detached, so the queue
+// keeps playing after the terminal closes.
+function ensureWatcher() {
   try {
-    const saved = JSON.parse(readFileSync(LASTOP_FILE, "utf8"));
-    return { vol: saved.vol || 0, t: saved.t || 0 };
-  } catch (e) {
-    return { vol: 0, t: 0 };
+    const pid = parseInt(readFileSync(PID_FILE, "utf8"));
+    if (pid > 0) { process.kill(pid, 0); return; } // alive
+  } catch (e) {} // no pidfile or dead pid
+  // compiled binary: re-exec ourselves; dev run: bun + this file
+  const cmd = import.meta.path.startsWith("/$bunfs")
+    ? [process.execPath, "watch"]
+    : [process.execPath, import.meta.path, "watch"];
+  const child = Bun.spawn(cmd, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+  mkdirSync(CACHE, { recursive: true });
+  writeFileSync(PID_FILE, String(child.pid));
+  child.unref();
+}
+
+// Fresh play: overwrite the queue and start at startId (or the top). The
+// whole list is kept, pos mid-list, so prev can walk backwards.
+function playTracks(tracks: QueueTrack[], startId?: string) {
+  const pos = startId ? Math.max(0, tracks.findIndex((t) => t.id === startId)) : 0;
+  writeQueue({ tracks, pos });
+  playTrack(tracks[pos]);
+  ensureWatcher();
+}
+
+// Queue op: append when Music is playing our queue; otherwise start a new
+// queue — behind the current foreign track if one is playing (pos -1),
+// immediately if not.
+function queueTracks(tracks: QueueTrack[]): "queued" | "started" {
+  const q = readQueue();
+  const s = jxa(`
+    const out = { state: music.playerState(), id: "" };
+    try { out.id = music.currentTrack.persistentID(); } catch (e) {}
+    return JSON.stringify(out);
+  `);
+  const active = s.state === "playing" || s.state === "paused";
+  if (q && active && (q.pos === -1 || q.tracks[q.pos]?.id === s.id)) {
+    writeQueue({ tracks: [...q.tracks, ...tracks], pos: q.pos });
+    ensureWatcher();
+    return "queued";
+  }
+  if (active) {
+    writeQueue({ tracks, pos: -1 });
+    ensureWatcher();
+    return "queued";
+  }
+  writeQueue({ tracks, pos: 0 });
+  playTrack(tracks[0]);
+  ensureWatcher();
+  return "started";
+}
+
+// next/prev walk the file queue when one is active; callers fall back to
+// Music's own transport (native playlist contexts) when these return false.
+function queueNext(): boolean {
+  const q = readQueue();
+  if (!q || q.pos + 1 >= q.tracks.length) return false;
+  writeQueue({ tracks: q.tracks, pos: q.pos + 1 });
+  playTrack(q.tracks[q.pos + 1]);
+  ensureWatcher();
+  return true;
+}
+
+function queuePrev(): boolean {
+  const q = readQueue();
+  if (!q || q.pos <= 0) return false;
+  writeQueue({ tracks: q.tracks, pos: q.pos - 1 });
+  playTrack(q.tracks[q.pos - 1]);
+  ensureWatcher();
+  return true;
+}
+
+// The watcher: poll Music, advance the queue when the current track ends.
+// It preempts just before the natural end — Music with no context either
+// stops or drifts into whatever stale context it last had, and we want
+// neither. Exits when the queue is done, deleted, or the user takes over.
+async function watch() {
+  process.on("SIGHUP", () => {}); // outlive the terminal
+  writeFileSync(PID_FILE, String(process.pid));
+  // migration from the playlist era: delete the leftover scratch playlist
+  jxaQuiet(`const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} }); while (old.length > 0) music.delete(old[0]); return "";`);
+  let lastRemaining = Infinity; // how close the last-seen track was to its end
+  let grace = 0; // consecutive ticks with an unexpected track (stale reads)
+  while (true) {
+    const q = readQueue();
+    if (!q) return;
+    const s = jxaQuiet(`
+      const out = { state: music.playerState(), id: "", pos: 0, dur: 0 };
+      try { out.id = music.currentTrack.persistentID(); out.pos = music.playerPosition() || 0; out.dur = music.currentTrack.duration() || 0; } catch (e) {}
+      return JSON.stringify(out);
+    `);
+    if (!s) { await Bun.sleep(1000); continue; } // transient error: skip the tick
+    const playing = s.state === "playing";
+    const active = playing || s.state === "paused";
+    const expected = q.pos >= 0 ? q.tracks[q.pos] : null;
+    const next = q.tracks[q.pos + 1]; // pos -1 → tracks[0]
+    const remaining = s.dur > 0 ? s.dur - s.pos : Infinity;
+    const advance = (to: number) => {
+      writeQueue({ tracks: q.tracks, pos: to });
+      playTrack(q.tracks[to], true);
+      lastRemaining = Infinity;
+      grace = 0;
+    };
+
+    if (!active) {
+      // stopped: a track we watched run out ended naturally → play on;
+      // otherwise the user hit stop → the queue is over.
+      if (lastRemaining < 3 && next) { advance(q.pos + 1); continue; }
+      writeQueue(null);
+      return;
+    }
+    if (expected && s.id === expected.id) {
+      grace = 0;
+      lastRemaining = remaining;
+      if (playing && remaining <= 0.6) {
+        if (next) { advance(q.pos + 1); continue; }
+        // end of the queue: stop before Music drifts into a stale context
+        await Bun.sleep(Math.max(0, (remaining - 0.15) * 1000));
+        jxaQuiet(`music.stop(); return "";`);
+        writeQueue(null);
+        return;
+      }
+    } else if (next && s.id === next.id) {
+      // our play landed, or the user skipped ahead to exactly this track
+      writeQueue({ tracks: q.tracks, pos: q.pos + 1 });
+      grace = 0;
+      lastRemaining = remaining;
+    } else if (q.pos === -1) {
+      // waiting out a foreign track; start the queue as it ends
+      lastRemaining = remaining;
+      if (playing && remaining <= 0.6) { advance(0); continue; }
+    } else {
+      // unexpected track: right after a natural end it's Music drifting
+      // into a stale context → reclaim; after a grace window for stale
+      // reads, it's the user playing something else → stand down.
+      if (lastRemaining < 3 && next) { advance(q.pos + 1); continue; }
+      if (++grace >= 3) { writeQueue(null); return; }
+    }
+    // tighten the poll near a track's end so the preempt lands cleanly
+    await Bun.sleep(playing && remaining < 2.5 ? 200 : 1000);
   }
 }
 
-// Record that a rebuild just ran (and the volume it saw), so the next op
-// can wait out Music's stale-read window and re-assert the volume.
-function markOp(vol: number) {
-  try {
-    mkdirSync(CACHE, { recursive: true });
-    writeFileSync(LASTOP_FILE, JSON.stringify({ vol: vol > 0 ? vol : lastOp().vol, t: Date.now() }));
-  } catch (e) {}
-}
-
-// replace=true swaps the entire upcoming list for `ids` (queue editing);
-// replace=false appends `ids` after whatever is already upcoming.
-function queueTracks(ids: string[], replace = false): { mode: string; shuffle: boolean } {
-  const prev = lastOp();
-  const soonAfterRebuild = Date.now() - prev.t < 1500;
-  const out = jxaRetry(`
-    // A rebuild just happened: player state reads (position, volume,
-    // current playlist) are stale for up to ~1s. Wait them out.
-    ${soonAfterRebuild ? "delay(0.7);" : ""}
-    const lib = music.libraryPlaylists[0];
-    ${trackResolver()}
-    const state = music.playerState();
-    const active = state === "playing" || state === "paused";
-    let currentId = "", pos = 0, inQueue = false;
-    try {
-      currentId = music.currentTrack.persistentID();
-      pos = music.playerPosition() || 0;
-      inQueue = music.currentPlaylist.name() === ${JSON.stringify(TEMP_PLAYLIST)};
-    } catch (e) {}
-    // currentPlaylist reads stale for ~1s after a rebuild; if the scratch
-    // playlist holds the current track, we are in the queue regardless.
-    if (!inQueue && active && currentId) {
-      try {
-        inQueue = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)}).tracks.persistentID().indexOf(currentId) >= 0;
-      } catch (e) {}
-    }
-    let shuffle = false;
-    try { shuffle = music.shuffleEnabled(); } catch (e) {}
-    // Music snapshots a playlist when play() starts — appending to it later
-    // does nothing to the running queue. So every queue op rebuilds the
-    // playlist as [current, leftover upcoming, new songs] and re-enters it,
-    // restoring the playback position.
-    let leftover = [];
-    if (active && inQueue && !${JSON.stringify(replace)}) {
-      try {
-        const before = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)}).tracks.persistentID();
-        const idx = before.indexOf(currentId);
-        if (idx >= 0) leftover = before.slice(idx + 1);
-      } catch (e) {}
-    }
-    const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
-    while (old.length > 0) music.delete(old[0]);
-    const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
-    const all = active && currentId ? [currentId, ...leftover, ...${JSON.stringify(ids)}] : ${JSON.stringify(ids)};
-    for (const id of all) { const t = byPid(id); if (t) { try { music.duplicate(t, { to: pl }); } catch (e) {} } }
-    // Everything below has already mutated the playlist, so it must never
-    // throw — a script error here would make the caller's retry duplicate
-    // the rebuild. Each step is best-effort.
-    if (active && currentId) {
-      // pl.play() restarts the current song from 0:00 before the seek lands,
-      // which is audible. Mute for the jump, then keep re-seeking until the
-      // position actually sticks and unmute the instant it does.
-      // Volume reads are stale for ~300ms after a set — right after another
-      // queue op, soundVolume() can report the previous op's mute (0). Fall
-      // back to the recently remembered volume so this op re-asserts it.
-      let vol = 0;
-      try { vol = music.soundVolume() || 0; } catch (e) {}
-      if (vol === 0) vol = ${Date.now() - prev.t < 30000 ? prev.vol : 0};
-      if (vol > 0) { try { music.soundVolume = 0; } catch (e) {} }
-      try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} } // the only call that adopts the playlist as context
-      try {
-        for (let i = 0; i < 20; i++) {
-          music.playerPosition = pos;
-          if (Math.abs((music.playerPosition() || 0) - pos) < 1.5) break;
-          delay(0.05);
-        }
-      } catch (e) {}
-      try { if (state === "paused") music.playpause(); } catch (e) {}
-      // Music drops volume sets issued while a track is still loading —
-      // keep asserting until the read agrees.
-      if (vol > 0) {
-        try {
-          for (let i = 0; i < 10; i++) {
-            music.soundVolume = vol;
-            if ((music.soundVolume() || 0) === vol) break;
-            delay(0.1);
-          }
-        } catch (e) {}
-      }
-      return JSON.stringify({ mode: "switched", shuffle, vol });
-    }
-    try { pl.play(); } catch (e) { try { delay(0.3); pl.play(); } catch (e2) {} }
-    return JSON.stringify({ mode: "started", shuffle, vol: 0 });
-  `);
-  markOp(out ? out.vol : 0);
-  return out;
-}
-
 function showQueue() {
-  const q = jxa(`
-    let names = [], artists = [], ids = [];
-    try {
-      const tr = music.playlists.byName(${JSON.stringify(TEMP_PLAYLIST)}).tracks;
-      if (tr.length > 0) { names = tr.name(); artists = tr.artist(); ids = tr.persistentID(); }
-    } catch (e) {} // no queue playlist yet
-    let cur = "";
-    try { if (music.currentPlaylist.name() === ${JSON.stringify(TEMP_PLAYLIST)}) cur = music.currentTrack.persistentID(); } catch (e) {}
-    return JSON.stringify({ names, artists, ids, cur });
-  `);
-  if (q.ids.length === 0) { console.log("queue is empty — juke queue <query>"); return; }
-  const curIdx = q.ids.indexOf(q.cur);
-  q.ids.forEach((_: string, i: number) => {
-    if (i === curIdx) console.log(`♪ ${q.names[i]}  ${DIM}${q.artists[i]}${RESET}`);
-    else if (curIdx >= 0 && i < curIdx) console.log(`${DIM}✓ ${q.names[i]}  ${q.artists[i]}${RESET}`);
-    else console.log(`  ${q.names[i]}  ${DIM}${q.artists[i]}${RESET}`);
+  const q = readQueue();
+  if (!q) { console.log("queue is empty — juke queue <query>"); return; }
+  q.tracks.forEach((t, i) => {
+    if (i === q.pos) console.log(`♪ ${t.name}  ${DIM}${t.artist}${RESET}`);
+    else if (i < q.pos) console.log(`${DIM}✓ ${t.name}  ${t.artist}${RESET}`);
+    else console.log(`  ${t.name}  ${DIM}${t.artist}${RESET}`);
   });
 }
 
 // Command-line album play: no cache to hand, so resolve the album in JXA.
 function playAlbum(album: string) {
-  jxa(`
-    const lib = music.libraryPlaylists[0];
-    const spec = lib.tracks.whose({ album: ${JSON.stringify(album)} });
+  const rows = jxa(`
+    const spec = music.libraryPlaylists[0].tracks.whose({ album: ${JSON.stringify(album)} });
+    let names = [], artists = [], ids = [], dbs = [];
+    try { names = spec.name(); artists = spec.artist(); ids = spec.persistentID(); dbs = spec.id(); }
+    catch (e) { return JSON.stringify([]); } // dead reference in album
     let discs = [], nums = [];
     try { discs = spec.discNumber(); nums = spec.trackNumber(); }
-    catch (e) { discs = new Array(spec.length).fill(0); nums = discs; } // dead reference in album: keep library order
+    catch (e) { discs = new Array(ids.length).fill(0); nums = discs; } // keep library order
     const order = discs.map((d, i) => i);
     order.sort((a, b) => (discs[a] - discs[b]) || (nums[a] - nums[b]));
-    const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
-    while (old.length > 0) music.delete(old[0]);
-    const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
-    for (const i of order) {
-      try { music.duplicate(spec[i], { to: pl }); } catch (e) {} // skip dead tracks
-    }
-    pl.play();
-    return "";
+    return JSON.stringify(order.map((i) => ({ id: ids[i], db: dbs[i], name: names[i], artist: artists[i] })));
   `);
+  if (rows.length > 0) playTracks(rows);
 }
 
+// Real playlists play natively — Music's own context does the advancing.
 function playPlaylist(name: string) {
+  writeQueue(null); // the playlist context takes over from any file queue
   jxa(`music.playlists.byName(${JSON.stringify(name)}).play(); return "";`);
 }
 
 // Command-line artist play: everything by the artist, album by album.
 function playArtist(name: string) {
-  jxa(`
-    const lib = music.libraryPlaylists[0];
-    const spec = lib.tracks.whose({ artist: ${JSON.stringify(name)} });
+  const rows = jxa(`
+    const spec = music.libraryPlaylists[0].tracks.whose({ artist: ${JSON.stringify(name)} });
+    let names = [], artists = [], ids = [], dbs = [];
+    try { names = spec.name(); artists = spec.artist(); ids = spec.persistentID(); dbs = spec.id(); }
+    catch (e) { return JSON.stringify([]); } // dead reference
     let albums = [], discs = [], nums = [];
     try { albums = spec.album(); discs = spec.discNumber(); nums = spec.trackNumber(); }
-    catch (e) { albums = new Array(spec.length).fill(""); discs = albums; nums = albums; } // dead reference: keep library order
+    catch (e) { albums = new Array(ids.length).fill(""); discs = albums; nums = albums; } // keep library order
     const order = albums.map((a, i) => i);
     order.sort((a, b) => String(albums[a]).localeCompare(String(albums[b])) || (discs[a] - discs[b]) || (nums[a] - nums[b]));
-    const old = music.userPlaylists.whose({ name: ${JSON.stringify(TEMP_PLAYLIST)} });
-    while (old.length > 0) music.delete(old[0]);
-    const pl = music.make({ new: "playlist", withProperties: { name: ${JSON.stringify(TEMP_PLAYLIST)} } });
-    for (const i of order) {
-      try { music.duplicate(spec[i], { to: pl }); } catch (e) {} // skip dead tracks
-    }
-    pl.play();
-    return "";
+    return JSON.stringify(order.map((i) => ({ id: ids[i], db: dbs[i], name: names[i], artist: artists[i] })));
   `);
+  if (rows.length > 0) playTracks(rows);
 }
 
 type Now = {
@@ -1016,21 +1064,21 @@ async function tui() {
         const elapsed = fmtTime(now.pos), total = fmtTime(now.duration);
         box(infoY + 5, DIM + elapsed + " ".repeat(Math.max(1, barW - elapsed.length - total.length)) + total + RESET, barW);
 
-        // Up next: whatever rows remain, straight from the play context.
+        // Up next: the file queue (or native context), via upcoming().
         // Each entry is a wrapped name line over a dim wrapped artist line,
         // with a blank row between entries so they read as separate songs.
         const nextY = infoY + 7;
         const maxY = r.y + r.h - 4; // keep the bottom rows for the status section
-        const curIdx = ctx.ids.indexOf(now.id);
-        const upcoming = curIdx >= 0 ? ctx.ids.length - 1 - curIdx : 0;
-        if (upcoming > 0 && maxY - nextY >= 2) {
-          const header = now.shuffle ? "up next ⇄" : "up next";
+        const up = upcoming();
+        if (up.length > 0 && maxY - nextY >= 2) {
+          // shuffle only shapes native contexts — the file queue plays in order
+          const header = now.shuffle && !activeQueue() ? "up next ⇄" : "up next";
           at(x, nextY, `${DIM}├─ ${header} ${"─".repeat(Math.max(0, inner - header.length - 4))}┤${RESET}`);
           const w = inner - 2;
-          let y = nextY + 1, j = curIdx + 1, shown = 0;
-          while (j < ctx.ids.length && shown < 8 && y <= maxY) {
-            const nameRows = wrapText(ctx.names[j] || "", w);
-            const artistRows = ctx.artists[j] ? wrapText(ctx.artists[j], w) : [];
+          let y = nextY + 1, j = 0, shown = 0;
+          while (j < up.length && shown < 8 && y <= maxY) {
+            const nameRows = wrapText(up[j].name || "", w);
+            const artistRows = up[j].artist ? wrapText(up[j].artist, w) : [];
             if (y + nameRows.length + artistRows.length - 1 > maxY) break; // whole entry or nothing
             for (const t of nameRows) { const tt = clip(t, w); box(y++, tt, tt.length); }
             for (const t of artistRows) { const tt = clip(t, w); box(y++, DIM + tt + RESET, tt.length); }
@@ -1113,18 +1161,16 @@ async function tui() {
     if (drill) {
       const t = selected(drill.tracks, (x) => !filter || matches(x, filter));
       if (!t) return;
-      // both go through the scratch playlist: starting a real playlist mid-way
-      // is only possible by rebuilding it from that track (see playTracksAsPlaylist)
-      playTracksAsPlaylist(drill.tracks.map((x) => x.id), t.id);
+      playTracks(drill.tracks.map(qt), t.id);
     } else if (tab === 0) {
       const t = selected(library, (x) => !filter || matches(x, filter));
-      if (t) playTracksAsPlaylist([t.id]);
+      if (t) playTracks([qt(t)]);
     } else if (tab === 1) {
       const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
-      if (a) playTracksAsPlaylist(a.tracks.map((x) => x.id));
+      if (a) playTracks(a.tracks.map(qt));
     } else if (tab === 3) {
       const a = selected(artists, (x) => !filter || x.name.toLowerCase().includes(filter.toLowerCase()));
-      if (a) playTracksAsPlaylist(a.tracks.map((x) => x.id));
+      if (a) playTracks(a.tracks.map(qt));
     } else {
       const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
       if (name) playPlaylist(name);
@@ -1133,8 +1179,21 @@ async function tui() {
     setTimeout(tick, 600); // give Music.app a beat, then show the new track
   };
 
-  // What's coming after the current track in the play context — the queue.
+  // The file queue, when it's really what Music is playing (or waiting
+  // behind the current track). A file that disagrees with reality is stale
+  // — the watcher stood down — and gets ignored.
+  const activeQueue = (): Queue | null => {
+    const q = readQueue();
+    if (!q) return null;
+    if (q.pos === -1 || q.tracks[q.pos]?.id === now.id) return q;
+    return null;
+  };
+
+  // What's coming after the current track: the file queue when active,
+  // otherwise the native play context (juke playlist).
   const upcoming = (): { id: string; name: string; artist: string }[] => {
+    const q = activeQueue();
+    if (q) return upNext(q);
     const curIdx = ctx.ids.indexOf(now.id);
     if (curIdx < 0) return [];
     return ctx.ids.slice(curIdx + 1).map((id, i) => ({
@@ -1142,69 +1201,73 @@ async function tui() {
     }));
   };
 
-  // Queue edits: any change means a rebuild + re-entry (Music snapshots the
-  // playlist on play), so each op writes the new upcoming list wholesale.
-  // Reorders keep the same track count, so the plName|plCount cache key
-  // won't notice them — force the context refetch after every edit.
-  const queueRefresh = () => {
-    ctxKey = "";
-    tick();
-    setTimeout(() => { ctxKey = ""; tick(); }, 600);
+  // Queue edits work on the file queue; editing while a native playlist
+  // plays adopts its upcoming tracks into a fresh file queue first, and the
+  // watcher owns playback from then on.
+  const editableQueue = (): Queue | null => {
+    const q = activeQueue();
+    if (q) return q;
+    const up = upcoming();
+    if (up.length === 0 || !now.id) return null;
+    return { tracks: [qt({ id: now.id, name: now.name, artist: now.artist }), ...up.map(qt)], pos: 0 };
   };
 
   const queueRemove = () => {
-    const up = upcoming();
-    if (up.length === 0) return;
-    up.splice(Math.min(qCursor, up.length - 1), 1);
-    queueTracks(up.map((u) => u.id), true);
-    queueRefresh();
+    const q = editableQueue();
+    if (!q || upNext(q).length === 0) return;
+    writeQueue(removeUpcoming(q, Math.min(qCursor, upNext(q).length - 1)));
+    ensureWatcher();
+    draw();
   };
 
   const queueMove = (d: number) => {
-    const up = upcoming();
-    if (up.length === 0) return;
-    const i = Math.min(qCursor, up.length - 1);
-    const j = i + d;
-    if (j < 0 || j >= up.length) return;
-    [up[i], up[j]] = [up[j], up[i]];
-    queueTracks(up.map((u) => u.id), true);
-    qCursor = j;
-    queueRefresh();
+    const q = editableQueue();
+    if (!q) return;
+    const i = Math.min(qCursor, upNext(q).length - 1);
+    const moved = moveUpcoming(q, i, d);
+    if (!moved) return;
+    writeQueue(moved);
+    ensureWatcher();
+    qCursor = i + d;
+    draw();
   };
 
   const queueJump = () => {
-    const up = upcoming();
-    if (up.length === 0) return;
-    const i = Math.min(qCursor, up.length - 1);
-    playTracksAsPlaylist(up.map((u) => u.id), up[i].id);
+    const q = editableQueue();
+    if (!q || upNext(q).length === 0) return;
+    const target = q.pos + 1 + Math.min(qCursor, upNext(q).length - 1);
+    writeQueue({ tracks: q.tracks, pos: target });
+    playTrack(q.tracks[target]);
+    ensureWatcher();
     qCursor = 0;
-    queueRefresh();
+    tick();
+    setTimeout(tick, 600);
   };
 
   // `a`: add the hovered thing to the queue (song, or whole album/playlist).
   const queueSelection = () => {
-    let ids: string[] = [];
+    let sel: { id: string; name: string; artist: string }[] = [];
     if (drill) {
       const t = selected(drill.tracks, (x) => !filter || matches(x, filter));
-      if (t) ids = [t.id];
+      if (t) sel = [t];
     } else if (tab === 0) {
       const t = selected(library, (x) => !filter || matches(x, filter));
-      if (t) ids = [t.id];
+      if (t) sel = [t];
     } else if (tab === 1) {
       const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
-      if (a) ids = a.tracks.map((t) => t.id);
+      if (a) sel = a.tracks;
     } else if (tab === 3) {
       const a = selected(artists, (x) => !filter || x.name.toLowerCase().includes(filter.toLowerCase()));
-      if (a) ids = a.tracks.map((t) => t.id);
+      if (a) sel = a.tracks;
     } else {
       const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
       if (name) {
         if (!playlistCache.has(name)) playlistCache.set(name, loadPlaylistTracks(name));
-        ids = playlistCache.get(name)!.map((t) => t.id);
+        sel = playlistCache.get(name)!;
       }
     }
-    if (ids.length === 0) return;
-    queueTracks(ids);
+    if (sel.length === 0) return;
+    queueTracks(sel.map(qt));
     tick();
     setTimeout(tick, 600); // let Music settle, then show the new queue
   };
@@ -1257,8 +1320,12 @@ async function tui() {
       case "\r": playSelection(); return;
       case "a": queueSelection(); return;
       case " ": act("music.playpause()"); return;
-      case `${ESC}C`: act("music.nextTrack()"); return;
-      case `${ESC}D`: act("music.backTrack()"); return;
+      case `${ESC}C`:
+        if (queueNext()) { tick(); setTimeout(tick, 400); } else act("music.nextTrack()");
+        return;
+      case `${ESC}D`:
+        if (queuePrev()) { tick(); setTimeout(tick, 400); } else act("music.backTrack()");
+        return;
       case "+": case "=": act("music.soundVolume = Math.min(100, music.soundVolume() + 5)", "vol"); return;
       case "-": act("music.soundVolume = Math.max(0, music.soundVolume() - 5)", "vol"); return;
       case "s": act("const v = !music.shuffleEnabled(); music.shuffleEnabled = v", "shuffle"); return;
@@ -1322,9 +1389,8 @@ function queueCmd(query: string) {
   if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
   const picked = pickMany(songs.map(songLabel), "queue");
   if (picked.length === 0) return;
-  const { mode, shuffle } = queueTracks(picked.map((i) => songs[i].id));
+  const mode = queueTracks(picked.map((i) => qt(songs[i])));
   console.log(`queued ${picked.length} song${picked.length === 1 ? "" : "s"}${mode === "started" ? " — playing" : ""}`);
-  if (shuffle) console.log(`${DIM}note: shuffle is on, so Music won't respect the queue order${RESET}`);
 }
 
 function main() {
@@ -1348,7 +1414,7 @@ function main() {
       if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
       const i = pick(songs.map(songLabel), "play");
       if (i === null) return;
-      playTracksAsPlaylist([songs[i].id]);
+      playTracks([qt(songs[i])]);
       console.log(`▶ ${songs[i].name} — ${songs[i].artist}`);
       break;
     }
@@ -1395,8 +1461,9 @@ function main() {
       break;
     }
     case "pause": jxa(`music.playpause(); return "";`); break;
-    case "next": jxa(`music.nextTrack(); return "";`); break;
-    case "prev": jxa(`music.backTrack(); return "";`); break;
+    case "next": if (!queueNext()) jxa(`music.nextTrack(); return "";`); break;
+    case "prev": if (!queuePrev()) jxa(`music.backTrack(); return "";`); break;
+    case "watch": watch(); return; // hidden: the queue-advancing watcher
     // Music.app applies sets asynchronously — reading right after returns the
     // old value. Report the value we set, don't read it back.
     case "shuffle": {
