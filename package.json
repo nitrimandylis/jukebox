@@ -7,6 +7,6 @@
     "juke": "./jukebox.ts"
   },
   "scripts": {
-    "compile": "bun build --compile jukebox.ts --outfile ~/.bun/bin/juke"
+    "compile": "bun build --compile jukebox.ts --outfile ~/.bun/bin/juke && mkdir -p $(brew --prefix)/share/man/man1 && cp man/juke.1 $(brew --prefix)/share/man/man1/"
   }
 }
