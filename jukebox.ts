@@ -975,15 +975,31 @@ async function ciderSearch(query: string): Promise<Song[]> {
 
 // ---- playback
 
-// `add-later` takes one id per call and answers in about a millisecond, so
-// a whole album is still well under a second.
+// `add-later` takes one id per call — an array under `id` is a 400 — and it
+// answers long before it acts. Two consequences, both measured:
 //
-// It cannot be verified by reading the queue back: Cider acknowledges the
-// write long before the queue reports it (measured at 500-870ms), so a
-// read-back right after the loop always looks like nothing landed. Adding
-// the difference on that evidence is how you get every song queued twice.
-async function ciderAddLater(tracks: Sel[]) {
-  for (const t of tracks) await ciderPost("/api/v2/queue/add-later", { type: "library-songs", id: t.id });
+// 1. Fired back to back, the adds land in the WRONG ORDER (5 tracks came
+//    back t1 t2 t5 t3 t4), which is what turned "play this album" into
+//    shuffle. Spacing the calls fixes it: 50ms still scrambles, 100ms is
+//    clean, so 150ms is the setting with some margin.
+// 2. The queue reports the write 500-870ms later, so reading it back to
+//    check what landed always says "nothing" — and re-adding on that
+//    evidence queues everything twice.
+//
+// A long list therefore fills in behind the first track rather than all at
+// once: 15s for a 101-track album, invisible while track one plays.
+const ADD_GAP_MS = 150;
+
+// Bumped by each new play so a superseded fill stops adding to a queue that
+// has already been replaced.
+let fillToken = 0;
+
+async function ciderAddLater(tracks: Sel[], token: number) {
+  for (const t of tracks) {
+    if (token !== fillToken) return; // a newer play took over
+    await ciderPost("/api/v2/queue/add-later", { type: "library-songs", id: t.id });
+    await Bun.sleep(ADD_GAP_MS);
+  }
 }
 
 // add-later does silently nothing while there is no session, and play-item
@@ -1000,12 +1016,13 @@ async function ciderStarted(id: string) {
 // the same two steps: start the first track, queue the rest behind it.
 async function ciderPlay(tracks: Sel[], startId?: string) {
   if (tracks.length === 0) return;
+  const token = ++fillToken;
   const start = startId ? Math.max(0, tracks.findIndex((t) => t.id === startId)) : 0;
   const first = tracks[start];
   await ciderPost("/api/v1/playback/play-item", { type: "library-songs", id: first.id });
   if (tracks.length === start + 1) return;
   await ciderStarted(first.id);
-  await ciderAddLater(tracks.slice(start + 1));
+  await ciderAddLater(tracks.slice(start + 1), token);
 }
 
 async function ciderNow(): Promise<Now> {
@@ -1133,7 +1150,7 @@ const ciderPlayer: Player = {
       await ciderPlay(tracks);
       return "started";
     }
-    await ciderAddLater(tracks);
+    await ciderAddLater(tracks, fillToken);
     return "queued";
   },
   // Albums and artists are just track lists — same two steps as everything else.

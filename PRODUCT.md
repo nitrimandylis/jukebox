@@ -55,14 +55,23 @@ toggle) against Music's off→all→one.
 
 **Cider's queue is eventually consistent, and that is the landmine.** A write
 (`add-later`, `remove-by-index`) returns 200 roughly 500-870ms before either
-`/v1/playback/queue` or `/v2/queue/position` reflects it. Two consequences,
-both learned the expensive way: never confirm a write by reading the queue
-back — the read says nothing landed and re-adding on that evidence queues
-every song twice — and never send an index-based op from a read more than a
-second old, because the queue shifts underneath and any `play-item` (from us,
-from you, from Cider's own UI) replaces the whole queue with a single track.
-Where `add-later` genuinely needs a session to exist, we poll `now-playing`
-until `play-item`'s track is really current instead of counting.
+`/v1/playback/queue` or `/v2/queue/position` reflects it. Three consequences,
+each learned the expensive way:
+
+1. **Never confirm a write by reading the queue back.** The read says nothing
+   landed, and re-adding on that evidence queues every song twice. Where
+   `add-later` genuinely needs a session to exist, poll `now-playing` until
+   `play-item`'s track is really current instead of counting.
+2. **Never space the adds less than ~100ms apart.** Fired back to back they
+   arrive out of order (five tracks came back t1 t2 t5 t3 t4), which is how
+   "play this album" turns into shuffle. 50ms still scrambles, 100ms is
+   clean; `ADD_GAP_MS` is 150 for margin. An `id` array is a 400, so there is
+   no bulk call to escape into. A long list fills in behind the first track
+   (~15s for 101 tracks) rather than all at once, and a new play cancels an
+   in-flight fill.
+3. **Never send an index-based op from a read more than a second old.** The
+   queue shifts underneath, and any `play-item` (from us, from you, from
+   Cider's own UI) replaces the whole queue with a single track.
 
 ## Design stance
 
