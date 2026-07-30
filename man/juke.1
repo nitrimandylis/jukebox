@@ -5,20 +5,23 @@ juke \- Apple Music for the terminal
 .B juke
 [\fIcommand\fR] [\fIquery\fR]
 .SH DESCRIPTION
-A three-panel TUI remote control for Music.app on macOS. Music.app keeps doing
-the playing; juke drives it over
+A three-panel TUI remote control for Music.app or Cider on macOS. The player
+app keeps doing the playing; juke drives Music.app over
 .BR osascript ,
-renders cover art as real pixels via the Kitty graphics protocol, and pulls
-time-synced lyrics from lrclib.net. Run with no command to open the TUI.
+or Cider over its local HTTP API, renders cover art as real pixels via the
+Kitty graphics protocol, and shows time-synced lyrics. Run with no command to
+open the TUI. See
+.B BACKENDS
+for how one is chosen.
 .SH COMMANDS
 .TP
 .B play [\fIquery\fR]
 Pick a song and play it. With no query, resume playback.
 .TP
 .B queue [\fIquery\fR]
-Pick songs to play next — appended to juke's own queue (see
-.BR QUEUE ).
-With no query, show the queue.
+Pick songs to play next — appended to juke's own queue on Music.app (see
+.BR QUEUE ),
+or to Cider's. With no query, show the current track and what follows it.
 .TP
 .B play \-q <\fIquery\fR>
 Same as
@@ -47,11 +50,38 @@ Music's own transport otherwise.
 Toggle shuffle.
 .TP
 .B repeat
-Cycle repeat (off \(-> all \(-> one).
+Cycle repeat. Music.app goes off \(-> all \(-> one; Cider exposes only a
+toggle, so there it goes none \(-> one \(-> all.
 .SH OPTIONS
 .TP
 .BR \-h ", " \-\-help
 Show help.
+.SH BACKENDS
+Music.app is the default. Cider 4 is used instead when
+.B JUKEBOX_CIDER_TOKEN
+is set
+.I and
+Cider's local API answers; otherwise juke falls back to Music.app silently.
+With no token nothing is probed, so Music.app users pay no startup cost.
+.B JUKEBOX_PLAYER
+overrides the choice, and
+.B JUKEBOX_PLAYER=cider
+with no reachable Cider is an error rather than a silent downgrade.
+.PP
+The backends differ in four visible ways: Cider uses its own queue instead of
+the file queue and watcher below, its library arrives over HTTP (a couple of
+seconds, during which the browser says
+.IR "loading library\(u2026" ),
+its lyrics are Apple's own rather than lrclib's, and it reports no play count.
+.SH ENVIRONMENT
+.TP
+.B JUKEBOX_CIDER_TOKEN
+Cider's External Application API token (Cider \(-> Settings \(->
+Connectivity). Setting it enables the Cider backend.
+.TP
+.B JUKEBOX_PLAYER
+.BR cider " or " music :
+pick the backend by hand.
 .SH TUI KEYS
 .B j/k
 or arrows move,
@@ -91,6 +121,9 @@ repeat,
 .B q
 quit.
 .SH QUEUE
+This section is about the Music.app backend only; Cider has a real queue and
+uses it.
+.PP
 Music.app never exposed its real Up Next to scripting, so juke keeps its own:
 .I ~/.cache/jukebox/queue.json
 plus a detached watcher process (spawned automatically by any play or queue
@@ -110,7 +143,8 @@ order.
 Cover art, lyrics, the queue file, and the watcher pidfile. Regenerable;
 safe to delete.
 .SH NOTES
-Lyrics come from lrclib.net (sends title/artist/duration when the lyrics view
-is open). macOS only.
+Lyrics come from Apple's own time-synced lyrics on Cider, and from lrclib.net
+otherwise (which sends title/artist/duration when the lyrics view is open).
+macOS only.
 .SH SEE ALSO
 .BR osascript (1)

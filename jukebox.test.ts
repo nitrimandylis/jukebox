@@ -125,3 +125,48 @@ test("moveUpcoming swaps neighbours, refuses to leave the upcoming list", () => 
   expect(moveUpcoming(queue(["a", "b", "c"], 0), 0, -1)).toBeNull(); // into the played part
   expect(ids(moveUpcoming(queue(["a", "b"], -1), 0, 1)!)).toEqual(["b", "a"]);
 });
+
+// --- backends
+
+test("queueIndex turns an upcoming index into a Cider queue index", () => {
+  const { queueIndex } = require("./jukebox.ts");
+  expect(queueIndex(0, 0)).toBe(1); // the next song, while track 0 plays
+  expect(queueIndex(3, 2)).toBe(6);
+});
+
+test("pickBackend: the env var wins, then a working token, else Music", () => {
+  const { pickBackend } = require("./jukebox.ts");
+  expect(pickBackend("cider", true, "ok")).toBe("cider");
+  expect(pickBackend("cider", false, "down")).toBe("fail"); // asked for it by name
+  expect(pickBackend("music", true, "ok")).toBe("music");
+  expect(pickBackend(undefined, false, "down")).toBe("music"); // no token, never probed
+  expect(pickBackend(undefined, true, "ok")).toBe("cider");
+  expect(pickBackend(undefined, true, "unauthorized")).toBe("music"); // stale token
+  expect(pickBackend(undefined, true, "down")).toBe("music"); // Cider not running
+});
+
+test("parseTTML reads Apple's line timings in all four shapes", () => {
+  const { parseTTML } = require("./jukebox.ts");
+  const ttml = `<tt><body><div>
+    <p begin="0.080" end="3.0">first</p>
+    <p begin="13.141">se<span>cond</span> line</p>
+    <p begin="2:27.610">third &amp; last</p>
+    <p begin="00:00:10.050">fourth</p>
+  </div></body></tt>`;
+  expect(parseTTML(ttml)).toEqual([
+    { t: 0.08, text: "first" },
+    { t: 13.141, text: "second line" },
+    { t: 147.61, text: "third & last" },
+    { t: 10.05, text: "fourth" },
+  ]);
+  expect(parseTTML("<tt></tt>")).toEqual([]);
+});
+
+test("parseTTML survives the escaping Cider's API proxy adds", () => {
+  const { parseTTML } = require("./jukebox.ts");
+  // run-v3 escapes the whole document, so callers decode once before parsing
+  // — an ampersand in the lyrics itself comes through double-escaped.
+  const escaped = `&lt;p begin="1.5"&gt;me &amp;amp; you&lt;/p&gt;`;
+  const dec = (s: string) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  expect(parseTTML(dec(escaped))).toEqual([{ t: 1.5, text: "me & you" }]);
+});

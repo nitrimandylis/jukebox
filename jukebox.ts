@@ -1,10 +1,14 @@
 #!/usr/bin/env bun
 // juke — Apple Music for the terminal (the jukebox project).
-// Music.app does the playing (its library is DRM'd, so nothing else can);
-// this CLI is the remote control and the pretty face. Data flows over
-// osascript: JXA for queries, AppleScript for the artwork dump. Album art
-// renders as real pixels via the Kitty graphics protocol (Ghostty, kitty,
-// WezTerm); everything else inherits the terminal's own theme.
+// Something else does the playing (an Apple Music library is DRM'd, so only
+// a real client can); this CLI is the remote control and the pretty face.
+// Album art renders as real pixels via the Kitty graphics protocol (Ghostty,
+// kitty, WezTerm); everything else inherits the terminal's own theme.
+//
+// Two backends, one Player interface: Music.app over osascript (JXA for
+// queries, AppleScript for the artwork dump), or Cider 4 over its local HTTP
+// API. Cider is used when JUKEBOX_CIDER_TOKEN is set and it answers;
+// JUKEBOX_PLAYER=cider|music decides by hand.
 //
 // Usage: juke                      the TUI (browser + player) — the main way
 //        juke play [query]         pick a song and play it (no query: resume)
@@ -357,14 +361,14 @@ async function watch() {
   }
 }
 
-function showQueue() {
-  const q = readQueue();
-  if (!q) { console.log("queue is empty — juke queue <query>"); return; }
-  q.tracks.forEach((t, i) => {
-    if (i === q.pos) console.log(`♪ ${t.name}  ${DIM}${t.artist}${RESET}`);
-    else if (i < q.pos) console.log(`${DIM}✓ ${t.name}  ${t.artist}${RESET}`);
-    else console.log(`  ${t.name}  ${DIM}${t.artist}${RESET}`);
-  });
+// ponytail: the current track and what follows it — played tracks are no
+// longer listed, because only the Music backend keeps a history of them.
+async function showQueue() {
+  const now = await player.now();
+  const up = await player.upcoming(now);
+  if (!now.id && up.length === 0) { console.log("queue is empty — juke queue <query>"); return; }
+  if (now.id) console.log(`♪ ${now.name}  ${DIM}${now.artist}${RESET}`);
+  for (const t of up) console.log(`  ${t.name}  ${DIM}${t.artist}${RESET}`);
 }
 
 // Command-line album play: no cache to hand, so resolve the album in JXA.
@@ -412,6 +416,14 @@ type Now = {
   id: string; name: string; artist: string; album: string; duration: number; pos: number;
   genre: string; year: number; plays: number; fav: boolean;
   plName: string; plCount: number; plSpecial: string; // current play context, for "up next"
+  catalogId?: string; // Apple Music catalog id, when the backend knows it (Cider)
+};
+
+// What the TUI shows before the first poll comes back.
+const NO_NOW: Now = {
+  state: "stopped", vol: 100, shuffle: false, repeat: "off",
+  id: "", name: "", artist: "", album: "", duration: 0, pos: 0,
+  genre: "", year: 0, plays: 0, fav: false, plName: "", plCount: 0, plSpecial: "",
 };
 
 function nowPlaying(): Now {
@@ -449,32 +461,88 @@ function contextTracks(): { ids: string[]; names: string[]; artists: string[] } 
   `);
 }
 
+// The file queue, when it's really what Music is playing (or waiting behind
+// the current track). A file that disagrees with reality is stale — the
+// watcher stood down — and gets ignored.
+function activeQueue(now: Now): Queue | null {
+  const q = readQueue();
+  if (!q) return null;
+  if (q.pos === -1 || q.tracks[q.pos]?.id === now.id) return q;
+  return null;
+}
+
+// Play-context cache: refetched only when the context changes.
+let ctx: { ids: string[]; names: string[]; artists: string[] } = { ids: [], names: [], artists: [] };
+let ctxKey = "";
+
+// What's coming after the current track: the file queue when active,
+// otherwise the native play context (juke playlist).
+function musicUpcoming(now: Now): Up[] {
+  const q = activeQueue(now);
+  if (q) return upNext(q);
+  // Only a real user playlist (specialKind "none") is a queue Music will
+  // actually play through — single-song plays land in the special "Music"
+  // master playlist, whose order never plays. That's not a queue.
+  const key = now.plName && now.plSpecial === "none" ? `${now.plName}|${now.plCount}` : "";
+  if (key !== ctxKey) {
+    ctxKey = key;
+    ctx = key ? contextTracks() : { ids: [], names: [], artists: [] };
+  }
+  const curIdx = ctx.ids.indexOf(now.id);
+  if (curIdx < 0) return [];
+  return ctx.ids.slice(curIdx + 1).map((id, i) => ({
+    id, name: ctx.names[curIdx + 1 + i] || "", artist: ctx.artists[curIdx + 1 + i] || "",
+  }));
+}
+
+// Queue edits work on the file queue; editing while a native playlist plays
+// adopts its upcoming tracks into a fresh file queue first, and the watcher
+// owns playback from then on.
+function editableQueue(now: Now): Queue | null {
+  const q = activeQueue(now);
+  if (q) return q;
+  const up = musicUpcoming(now);
+  if (up.length === 0 || !now.id) return null;
+  return { tracks: [qt({ id: now.id, name: now.name, artist: now.artist }), ...up.map(qt)], pos: 0 };
+}
+
 // ---------------------------------------------------------------------------
 // Album art: AppleScript dumps the raw JPEG/PNG, sips (ships with macOS)
 // makes a 512px PNG for the terminal and a 1x1 BMP whose single pixel is the
 // average color of the whole cover — that's the accent color.
 
-function fetchArt(id: string): { png: string; accent: [number, number, number] } | null {
+// Where a track's artwork files live. Only the step that produces the .raw
+// differs between backends; both share the sips pair below, so both look
+// identical on screen.
+function artPaths(id: string) {
   const safe = id.replace(/[^A-Za-z0-9]/g, "");
-  const png = `${CACHE}/${safe}.png`, bmp = `${CACHE}/${safe}.bmp`, raw = `${CACHE}/${safe}.raw`;
-  if (!existsSync(png) || !existsSync(bmp)) {
-    mkdirSync(CACHE, { recursive: true });
-    const script = `tell application "Music"
+  return { png: `${CACHE}/${safe}.png`, bmp: `${CACHE}/${safe}.bmp`, raw: `${CACHE}/${safe}.raw` };
+}
+
+function artFromRaw(p: { png: string; bmp: string; raw: string }): Art | null {
+  Bun.spawnSync(["sips", "-s", "format", "png", "-Z", "512", p.raw, "--out", p.png]);
+  Bun.spawnSync(["sips", "-z", "1", "1", "-s", "format", "bmp", p.raw, "--out", p.bmp]);
+  if (!existsSync(p.png) || !existsSync(p.bmp)) return null;
+  return { png: p.png, accent: bmpPixel(readFileSync(p.bmp)) };
+}
+
+function fetchArt(id: string): Art | null {
+  const p = artPaths(id);
+  if (existsSync(p.png) && existsSync(p.bmp)) return { png: p.png, accent: bmpPixel(readFileSync(p.bmp)) };
+  mkdirSync(CACHE, { recursive: true });
+  const safe = id.replace(/[^A-Za-z0-9]/g, "");
+  const script = `tell application "Music"
       set t to first track of library playlist 1 whose persistent ID is "${safe}"
       if (count of artworks of t) is 0 then return "none"
       set d to raw data of artwork 1 of t
     end tell
-    set f to open for access POSIX file "${raw}" with write permission
+    set f to open for access POSIX file "${p.raw}" with write permission
     set eof f to 0
     write d to f
     close access f
     return "ok"`;
-    if (osascript(["-e", script]) !== "ok") return null;
-    Bun.spawnSync(["sips", "-s", "format", "png", "-Z", "512", raw, "--out", png]);
-    Bun.spawnSync(["sips", "-z", "1", "1", "-s", "format", "bmp", raw, "--out", bmp]);
-    if (!existsSync(png) || !existsSync(bmp)) return null;
-  }
-  return { png, accent: bmpPixel(readFileSync(bmp)) };
+  if (osascript(["-e", script]) !== "ok") return null;
+  return artFromRaw(p);
 }
 
 // A BMP stores its pixel-data offset at byte 10 (little-endian) and pixels as
@@ -527,14 +595,23 @@ export function parseLyrics(synced: string | null, plain: string | null): LyricL
   return [];
 }
 
-async function fetchLyrics(now: Now): Promise<LyricLine[]> {
-  const safe = now.id.replace(/[^A-Za-z0-9]/g, "");
-  const cache = `${CACHE}/${safe}.lyrics.json`;
+// The cache shell both backends share: one file per track id, and only real
+// answers get written (null means "ask again next time"). The two id spaces
+// never collide, so one cache serves both.
+async function cachedLyrics(id: string, get: () => Promise<LyricLine[] | null>): Promise<LyricLine[]> {
+  const cache = `${CACHE}/${id.replace(/[^A-Za-z0-9]/g, "")}.lyrics.json`;
   if (existsSync(cache)) return JSON.parse(readFileSync(cache, "utf8"));
+  const lines = await get();
+  if (!lines) return [];
   mkdirSync(CACHE, { recursive: true });
+  Bun.write(cache, JSON.stringify(lines));
+  return lines;
+}
+
+// null: lrclib was unreachable, so don't cache the miss.
+async function lrclibLyrics(now: Now): Promise<LyricLine[] | null> {
   const headers = { "User-Agent": "jukebox (terminal Apple Music player)" };
   let lines: LyricLine[] = [];
-  let definitive = true; // only cache real answers, not network failures
   try {
     const params = new URLSearchParams({
       track_name: now.name, artist_name: now.artist,
@@ -554,9 +631,12 @@ async function fetchLyrics(now: Now): Promise<LyricLine[]> {
         if (best) lines = parseLyrics(best.syncedLyrics, best.plainLyrics);
       }
     }
-  } catch (e) { definitive = false; } // offline or lrclib slow: retry next open
-  if (definitive) Bun.write(cache, JSON.stringify(lines));
+  } catch (e) { return null; } // offline or lrclib slow: retry next open
   return lines;
+}
+
+function fetchLyrics(now: Now): Promise<LyricLine[]> {
+  return cachedLyrics(now.id, () => lrclibLyrics(now));
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +736,511 @@ export function groupAlbums(tracks: Track[]): AlbumEntry[] {
 }
 
 // ---------------------------------------------------------------------------
+// Backends. The TUI and the commands never touch Music.app or Cider
+// directly — they talk to a Player. Everything above this line is the
+// Music.app implementation; the Cider one is written natively below.
+//
+// Queue indices are upcoming-relative: 0 is the next song, matching the
+// cursor in the queue view. Each backend translates to its own numbering.
+
+// The least a thing needs to be played or queued.
+export type Sel = { id: string; name: string; artist: string };
+export type Up = { id: string; name: string; artist: string };
+export type Art = { png: string; accent: [number, number, number] };
+
+export type Player = {
+  kind: "music" | "cider";
+  library(): Promise<Track[]>;
+  playlists(): Promise<string[]>;
+  playlistTracks(name: string): Promise<Track[]>;
+  search(query: string): Promise<Song[]>;
+  now(): Promise<Now>;
+  art(now: Now): Promise<Art | null>;
+  lyrics(now: Now): Promise<LyricLine[]>;
+  play(tracks: Sel[], startId?: string): Promise<void>;
+  queue(tracks: Sel[]): Promise<"queued" | "started">;
+  playAlbum(name: string): Promise<void>;
+  playArtist(name: string): Promise<void>;
+  playPlaylist(name: string): Promise<void>;
+  resume(): Promise<void>;
+  playpause(): Promise<void>;
+  next(): Promise<void>;
+  prev(): Promise<void>;
+  volume(delta: number): Promise<void>;
+  shuffle(): Promise<boolean>;
+  repeat(): Promise<string>;
+  upcoming(now: Now): Promise<Up[]>;
+  // Whether the upcoming list is only an approximation because shuffle
+  // reshapes it (Music's native contexts do; a file queue doesn't).
+  upcomingShuffled(now: Now): boolean;
+  queueRemove(now: Now, i: number): Promise<void>;
+  queueMove(now: Now, i: number, d: number): Promise<number>; // → new cursor
+  queueJump(now: Now, i: number): Promise<void>;
+};
+
+// ponytail: a thin adapter over the free functions above, not a refactor of
+// them. The Music backend's real code is everything preceding this.
+const musicPlayer: Player = {
+  kind: "music",
+  async library() { return loadLibrary().sort((a, b) => b.added - a.added); },
+  async playlists() { return loadPlaylistNames(); },
+  async playlistTracks(name) { return loadPlaylistTracks(name); },
+  async search(query) { return searchLibrary(query); },
+  async now() { return nowPlaying(); },
+  async art(now) { return fetchArt(now.id); },
+  async lyrics(now) { return fetchLyrics(now); },
+  async play(tracks, startId) { playTracks(tracks.map(qt), startId); },
+  async queue(tracks) { return queueTracks(tracks.map(qt)); },
+  async playAlbum(name) { playAlbum(name); },
+  async playArtist(name) { playArtist(name); },
+  async playPlaylist(name) { playPlaylist(name); },
+  async resume() { jxa(`music.play(); return "";`); },
+  async playpause() { jxa(`music.playpause(); return "";`); },
+  async next() { if (!queueNext()) jxa(`music.nextTrack(); return "";`); },
+  async prev() { if (!queuePrev()) jxa(`music.backTrack(); return "";`); },
+  async volume(delta) {
+    jxa(`music.soundVolume = Math.max(0, Math.min(100, music.soundVolume() + (${delta}))); return "";`);
+  },
+  // Music.app applies sets asynchronously — reading right after returns the
+  // old value. Report the value we set, don't read it back.
+  async shuffle() {
+    return jxa(`const v = !music.shuffleEnabled(); music.shuffleEnabled = v; return JSON.stringify(v);`);
+  },
+  async repeat() {
+    return jxa(`const v = { off: "all", all: "one", one: "off" }[music.songRepeat()]; music.songRepeat = v; return JSON.stringify(v);`);
+  },
+  async upcoming(now) { return musicUpcoming(now); },
+  upcomingShuffled(now) { return !activeQueue(now); },
+  async queueRemove(now, i) {
+    const q = editableQueue(now);
+    if (!q || upNext(q).length === 0) return;
+    writeQueue(removeUpcoming(q, Math.min(i, upNext(q).length - 1)));
+    ensureWatcher();
+  },
+  async queueMove(now, i, d) {
+    const q = editableQueue(now);
+    if (!q) return i;
+    const from = Math.min(i, upNext(q).length - 1);
+    const moved = moveUpcoming(q, from, d);
+    if (!moved) return i;
+    writeQueue(moved);
+    ensureWatcher();
+    return from + d;
+  },
+  async queueJump(now, i) {
+    const q = editableQueue(now);
+    if (!q || upNext(q).length === 0) return;
+    const target = q.pos + 1 + Math.min(i, upNext(q).length - 1);
+    writeQueue({ tracks: q.tracks, pos: target });
+    playTrack(q.tracks[target]);
+    ensureWatcher();
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Cider: the second backend, a peer of Music.app rather than a transport for
+// it. Cider 4 serves a local API on 10767 (Settings → Connectivity mints the
+// token); it owns its own queue, so nothing here needs the watcher, the queue
+// file, or osascript. The mounts are genuinely mixed v1/v2 — the version in
+// each path below is measured, not guessed.
+
+const CIDER = "http://127.0.0.1:10767";
+const ciderHeaders = () => ({
+  apptoken: process.env.JUKEBOX_CIDER_TOKEN || "",
+  "content-type": "application/json",
+});
+
+// Both return null instead of throwing: Cider quitting mid-session should
+// freeze the panel, not kill the TUI.
+async function ciderGet(path: string): Promise<any> {
+  try {
+    const res = await fetch(`${CIDER}${path}`, { headers: ciderHeaders(), signal: AbortSignal.timeout(5000) });
+    return res.ok ? await res.json() : null;
+  } catch (e) { return null; }
+}
+
+async function ciderPost(path: string, body: unknown = {}): Promise<any> {
+  try {
+    // a JSON content-type with no body is a 400, so every POST sends at least {}
+    const res = await fetch(`${CIDER}${path}`, {
+      method: "POST", headers: ciderHeaders(), body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10000),
+    });
+    return res.ok ? await res.json().catch(() => ({})) : null;
+  } catch (e) { return null; }
+}
+
+// v1 answers flat ({status, ...}); v2 wraps everything in {data}. Guessing
+// wrong reads as "Cider told us nothing", so the two have separate readers.
+async function ciderV2(path: string): Promise<any> {
+  return (await ciderGet(path))?.data ?? null;
+}
+
+// The real Apple Music API, proxied through Cider on the user's own
+// subscription — no developer token anywhere.
+async function amapi(path: string): Promise<any> {
+  const res = await ciderPost("/api/v1/amapi/run-v3", { path });
+  return res?.data ?? null;
+}
+
+// run-v3 HTML-escapes every string it passes through, so a song called
+// "Rock & Roll" arrives as "Rock &amp; Roll". Undo it wherever text reaches
+// the screen.
+function dec(s: string): string {
+  return s.replace(/&(amp|lt|gt|quot|apos|#39);/g, (_, e) =>
+    ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", "#39": "'" } as Record<string, string>)[e]);
+}
+
+let storefront = ""; // e.g. "gr" — asked once, then remembered
+async function ciderStorefront(): Promise<string> {
+  if (!storefront) storefront = (await amapi("/v1/me/storefront"))?.data?.[0]?.id || "us";
+  return storefront;
+}
+
+// ---- library
+
+// `library-songs` carries no album artist, so `include=albums` brings the
+// real one along — without it, compilations shatter into one album per
+// track. `added` is a synthetic rank (newest = highest) because the API
+// refuses to return dateAdded as a field: it only sorts by it.
+function ciderTracks(items: any[], total: number, offset: number): Track[] {
+  return items.map((it: any, i: number) => {
+    const a = it.attributes || {};
+    const album = it.relationships?.albums?.data?.[0]?.attributes;
+    return {
+      id: it.id,
+      name: dec(a.name || ""),
+      artist: dec(a.artistName || ""),
+      album: dec(a.albumName || ""),
+      albumArtist: dec(album?.artistName || ""),
+      disc: a.discNumber || 0,
+      track: a.trackNumber || 0,
+      added: total - (offset + i),
+    };
+  });
+}
+
+const PAGE = 100;
+
+async function ciderLibrary(): Promise<Track[]> {
+  const q = (offset: number) =>
+    `/v1/me/library/songs?limit=${PAGE}&offset=${offset}&sort=-dateAdded&include=albums`;
+  const first = await amapi(q(0));
+  if (!first) return [];
+  const total = first.meta?.total ?? first.data.length;
+  // page 1 tells us the size; the rest go out at once (~2.5s for 1900 songs)
+  const offsets: number[] = [];
+  for (let o = PAGE; o < total; o += PAGE) offsets.push(o);
+  const rest = await Promise.all(offsets.map((o) => amapi(q(o))));
+  const out = ciderTracks(first.data, total, 0);
+  rest.forEach((page, i) => { if (page?.data) out.push(...ciderTracks(page.data, total, offsets[i])); });
+  return out.sort((a, b) => b.added - a.added);
+}
+
+let playlistIds: Record<string, string> = {}; // name → p.xxxx, filled by playlists()
+
+async function ciderPlaylists(): Promise<string[]> {
+  const res = await amapi(`/v1/me/library/playlists?limit=${PAGE}`);
+  const names: string[] = [];
+  for (const p of res?.data || []) {
+    const name = p.attributes?.name;
+    if (!name) continue;
+    playlistIds[dec(name)] = p.id;
+    names.push(dec(name));
+  }
+  return names;
+}
+
+async function ciderPlaylistTracks(name: string): Promise<Track[]> {
+  const id = playlistIds[name];
+  if (!id) return [];
+  const res = await amapi(`/v1/me/library/playlists/${id}/tracks?limit=${PAGE}`);
+  // ponytail: first 100 tracks — deeper playlists need paging, add it if one bites
+  return ciderTracks(res?.data || [], 0, 0);
+}
+
+// One request, unlike the library fetch: the commands must stay instant.
+async function ciderSearch(query: string): Promise<Song[]> {
+  const res = await amapi(
+    `/v1/me/library/search?term=${encodeURIComponent(query)}&types=library-songs&limit=25`,
+  );
+  const items = res?.results?.["library-songs"]?.data || [];
+  return items.map((it: any) => ({
+    id: it.id,
+    name: dec(it.attributes?.name || ""),
+    artist: dec(it.attributes?.artistName || ""),
+    album: dec(it.attributes?.albumName || ""),
+  }));
+}
+
+// ---- playback
+
+// `add-later` takes one id per call and answers in about a millisecond, so
+// a whole album is still well under a second.
+//
+// It cannot be verified by reading the queue back: Cider acknowledges the
+// write long before the queue reports it (measured at 500-870ms), so a
+// read-back right after the loop always looks like nothing landed. Adding
+// the difference on that evidence is how you get every song queued twice.
+async function ciderAddLater(tracks: Sel[]) {
+  for (const t of tracks) await ciderPost("/api/v2/queue/add-later", { type: "library-songs", id: t.id });
+}
+
+// add-later does silently nothing while there is no session, and play-item
+// answers before it has actually made one — so wait for the track to really
+// be playing before queueing anything behind it.
+async function ciderStarted(id: string) {
+  for (let i = 0; i < 15; i++) { // ponytail: 1.5s ceiling, then queue anyway
+    if ((await ciderGet("/api/v1/playback/now-playing"))?.info?.playParams?.id === id) return;
+    await Bun.sleep(100);
+  }
+}
+
+// Playing anything — one song, an album, an artist, a filtered handful — is
+// the same two steps: start the first track, queue the rest behind it.
+async function ciderPlay(tracks: Sel[], startId?: string) {
+  if (tracks.length === 0) return;
+  const start = startId ? Math.max(0, tracks.findIndex((t) => t.id === startId)) : 0;
+  const first = tracks[start];
+  await ciderPost("/api/v1/playback/play-item", { type: "library-songs", id: first.id });
+  if (tracks.length === start + 1) return;
+  await ciderStarted(first.id);
+  await ciderAddLater(tracks.slice(start + 1));
+}
+
+async function ciderNow(): Promise<Now> {
+  // six reads, all at once: still one round trip on loopback
+  const [np, time, state, shuffle, repeat, volume] = await Promise.all([
+    ciderGet("/api/v1/playback/now-playing"),
+    ciderV2("/api/v2/playback/time"),
+    ciderV2("/api/v2/playback/state"),
+    ciderV2("/api/v2/playback/shuffle"),
+    ciderV2("/api/v2/playback/repeat"),
+    ciderGet("/api/v1/playback/volume"),
+  ]);
+  const info = np?.info;
+  if (!info) return NO_NOW;
+  return {
+    state: state?.state === "playing" ? "playing" : "paused",
+    vol: Math.round((volume?.volume ?? 1) * 100),
+    shuffle: !!shuffle?.enabled,
+    // Cider says "none" where Music says "off"; the panel speaks Music's word
+    repeat: repeat?.mode === "none" ? "off" : repeat?.mode || "off",
+    id: info.playParams?.id || "",
+    catalogId: info.playParams?.catalogId,
+    name: info.name || "",
+    artist: info.artistName || "",
+    album: info.albumName || "",
+    duration: time?.duration ?? (info.durationInMillis || 0) / 1000, // both seconds
+    pos: time?.currentTime ?? 0,
+    genre: info.genreNames?.[0] || "",
+    year: parseInt(info.releaseDate) || 0,
+    plays: 0, // ponytail: Cider exposes no play count — the details line drops it
+    fav: !!info.inFavorites,
+    plName: "", plCount: 0, plSpecial: "", // Cider has one queue, no play context
+  };
+}
+
+// The queue read has to be v1: v2 answers with catalog ids, which never
+// match the library ids now-playing reports.
+async function ciderQueue(): Promise<{ items: any[]; position: number }> {
+  const [items, pos] = await Promise.all([
+    ciderGet("/api/v1/playback/queue"), // a bare array, and the only read with library ids
+    ciderV2("/api/v2/queue/position"),
+  ]);
+  return { items: Array.isArray(items) ? items : [], position: pos?.position ?? 0 };
+}
+
+// The Player speaks upcoming-relative indices (0 = the next song); Cider
+// numbers the whole queue, current track included.
+export function queueIndex(position: number, i: number): number {
+  return position + 1 + i;
+}
+
+async function ciderUpcoming(): Promise<Up[]> {
+  const { items, position } = await ciderQueue();
+  return items.slice(queueIndex(position, 0)).map((it: any) => ({
+    id: it.id || it.attributes?.playParams?.id || "",
+    name: it.attributes?.name || "",
+    artist: it.attributes?.artistName || "",
+  }));
+}
+
+async function ciderQueueIndex(i: number): Promise<number> {
+  const { position } = await ciderQueue();
+  return queueIndex(position, i);
+}
+
+async function ciderLyrics(now: Now): Promise<LyricLine[]> {
+  return cachedLyrics(now.id, async () => {
+    // Gate on the catalog id, not on a hasLyrics flag: without a catalog id
+    // (a track you uploaded yourself) there is nothing to ask Apple about.
+    if (!now.catalogId) return lrclibLyrics(now);
+    const res = await amapi(`/v1/catalog/${await ciderStorefront()}/songs/${now.catalogId}/lyrics`);
+    const ttml = res?.data?.[0]?.attributes?.ttml;
+    if (!ttml) return lrclibLyrics(now);
+    // run-v3 escaped the whole document, tags and all: `dec` gives back real
+    // XML, and parseTTML then decodes the entities in the lyrics themselves.
+    return parseTTML(dec(ttml));
+  });
+}
+
+// Apple ships time-synced lyrics as TTML, one <p> per line. Timestamps come
+// in four shapes — 0.080, 13.141, 2:27.610, 00:00:10.050 — and splitting on
+// ":" handles all of them.
+export function parseTTML(xml: string): LyricLine[] {
+  const lines: LyricLine[] = [];
+  for (const m of xml.matchAll(/<p\b[^>]*\bbegin="([^"]+)"[^>]*>([\s\S]*?)<\/p>/g)) {
+    const t = m[1].split(":").reduce((acc, part) => acc * 60 + parseFloat(part), 0);
+    const text = dec(m[2].replace(/<[^>]*>/g, "")) // word-level <span>s inside the line
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!isNaN(t)) lines.push({ t, text });
+  }
+  return lines;
+}
+
+async function ciderArt(now: Now, url: string): Promise<Art | null> {
+  const p = artPaths(now.id);
+  if (existsSync(p.png) && existsSync(p.bmp)) return { png: p.png, accent: bmpPixel(readFileSync(p.bmp)) };
+  try {
+    // queue entries carry a {w}x{h} template; now-playing hands out a URL
+    // that is already sized, and either way sips takes it down to 512
+    const res = await fetch(url.replace("{w}x{h}", "512x512"), { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return null;
+    mkdirSync(CACHE, { recursive: true });
+    await Bun.write(p.raw, await res.arrayBuffer());
+  } catch (e) { return null; }
+  return artFromRaw(p); // identical sips pair to Music.app's path
+}
+
+const ciderPlayer: Player = {
+  kind: "cider",
+  library: ciderLibrary,
+  playlists: ciderPlaylists,
+  playlistTracks: ciderPlaylistTracks,
+  search: ciderSearch,
+  now: ciderNow,
+  async art(now) {
+    const url = (await ciderGet("/api/v1/playback/now-playing"))?.info?.artwork?.url;
+    return url ? ciderArt(now, url) : null;
+  },
+  lyrics: ciderLyrics,
+  play: ciderPlay,
+  async queue(tracks) {
+    const playing = (await ciderGet("/api/v1/playback/is-playing"))?.is_playing;
+    if (!playing && (await ciderQueue()).items.length === 0) {
+      await ciderPlay(tracks);
+      return "started";
+    }
+    await ciderAddLater(tracks);
+    return "queued";
+  },
+  // Albums and artists are just track lists — same two steps as everything else.
+  async playAlbum(name) {
+    const tracks = (await ciderSearch(name)).filter((s) => s.album === name);
+    await ciderPlay(tracks);
+  },
+  async playArtist(name) {
+    const tracks = (await ciderSearch(name)).filter((s) => s.artist === name);
+    await ciderPlay(tracks);
+  },
+  async playPlaylist(name) {
+    await ciderPlay(await ciderPlaylistTracks(name));
+  },
+  async resume() { await ciderPost("/api/v1/playback/play"); },
+  async playpause() { await ciderPost("/api/v1/playback/toggle"); },
+  async next() { await ciderPost("/api/v1/playback/next"); },
+  async prev() { await ciderPost("/api/v1/playback/previous"); },
+  async volume(delta) {
+    const cur = (await ciderGet("/api/v1/playback/volume"))?.volume ?? 1;
+    // Cider's volume is a 0..1 float, not 0..100
+    await ciderPost("/api/v1/playback/volume", { volume: Math.max(0, Math.min(1, cur + delta / 100)) });
+  },
+  async shuffle() {
+    await ciderPost("/api/v2/playback/shuffle/toggle");
+    return !!(await ciderV2("/api/v2/playback/shuffle"))?.enabled;
+  },
+  // ponytail: there is only a toggle, so `r` cycles none→one→all here where
+  // Music cycles off→all→one. Same key, same idea, different order.
+  async repeat() {
+    await ciderPost("/api/v2/playback/repeat/toggle");
+    const mode = (await ciderV2("/api/v2/playback/repeat"))?.mode;
+    return mode === "none" ? "off" : mode || "off";
+  },
+  async upcoming() { return ciderUpcoming(); },
+  upcomingShuffled() { return false; }, // the queue Cider reports is the real order
+  async queueRemove(_now, i) {
+    await ciderPost("/api/v1/playback/queue/remove-by-index", { index: await ciderQueueIndex(i) });
+  },
+  async queueMove(_now, i, d) {
+    const from = await ciderQueueIndex(i);
+    await ciderPost("/api/v2/queue/move", { from, to: from + d });
+    return i + d;
+  },
+  async queueJump(_now, i) {
+    await ciderPost("/api/v2/queue/jump", { index: await ciderQueueIndex(i) });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Which backend
+
+// Pure so it can be tested: the probe and the environment are the caller's
+// problem. "fail" means the user asked for Cider by name and it isn't there.
+export function pickBackend(
+  env: string | undefined,
+  hasToken: boolean,
+  probe: "ok" | "unauthorized" | "down",
+): "music" | "cider" | "fail" {
+  if (env === "cider") return probe === "ok" ? "cider" : "fail";
+  if (env === "music") return "music";
+  if (!hasToken) return "music"; // never probed, so Music users wait for nothing
+  return probe === "ok" ? "cider" : "music";
+}
+
+// Unauthenticated, this route is a 403 — so a plain "does it answer" probe
+// would call a locked Cider healthy. Only a 200 counts.
+async function ciderProbe(): Promise<"ok" | "unauthorized" | "down"> {
+  try {
+    const res = await fetch(`${CIDER}/api/v1/playback/is-playing`, {
+      headers: ciderHeaders(), signal: AbortSignal.timeout(500),
+    });
+    if (res.ok) return "ok";
+    return res.status === 401 || res.status === 403 ? "unauthorized" : "down";
+  } catch (e) { return "down"; }
+}
+
+const CIDER_HELP = `juke: JUKEBOX_PLAYER=cider, but Cider isn't answering on ${CIDER}
+  · start Cider, then Settings → Connectivity → External Application API
+  · create a token there and export JUKEBOX_CIDER_TOKEN=… in your shell`;
+
+let player: Player = musicPlayer;
+
+// Chosen once at startup. `isTui` gates the one advisory line: a transport
+// command like `juke pause` stays silent whatever happens.
+async function choosePlayer(isTui: boolean) {
+  const env = process.env.JUKEBOX_PLAYER;
+  const hasToken = !!process.env.JUKEBOX_CIDER_TOKEN;
+  const probe = env === "music" || (!hasToken && env !== "cider") ? "down" : await ciderProbe();
+  const choice = pickBackend(env, hasToken, probe);
+  if (choice === "fail") { console.error(CIDER_HELP); process.exit(1); }
+  if (choice === "music") {
+    if (isTui && probe === "unauthorized") {
+      console.error(`${DIM}juke: Cider is running but rejected the token — using Music.app${RESET}`);
+    }
+    return;
+  }
+  player = ciderPlayer;
+  // A watcher left running from a Music session would fight Cider for
+  // playback; dropping the queue file is how it stands down.
+  try {
+    process.kill(parseInt(readFileSync(PID_FILE, "utf8")), 0);
+    writeQueue(null);
+  } catch (e) {} // no watcher
+}
+
+// ---------------------------------------------------------------------------
 // Picking from a list: fzf when available, numbered list otherwise.
 
 function pick(lines: string[], header: string): number | null {
@@ -711,33 +1296,16 @@ async function tui() {
     process.exit(1);
   }
 
-  // Everything the browser shows comes from this one startup snapshot.
-  const library = loadLibrary().sort((a, b) => b.added - a.added);
-  const albums = groupAlbums(library);
-  const artists = groupArtists(library);
-  const playlistNames = loadPlaylistNames();
-  const playlistCache = new Map<string, Track[]>();
-
+  // Alt screen first, library second: the player panel is live within a
+  // frame or two while the browser still says "loading library…". Browse
+  // keys are inert until it lands, which the cursor clamping already
+  // handles — an empty list keeps the cursor at 0.
   process.stdout.write(`${ESC}?1049h${ESC}?25l${ESC}2J`); // alt screen, hide cursor
   process.stdin.setRawMode(true);
   process.stdin.resume();
 
-  // --- state
-  let tab = 0;
-  let cursor = 0, scroll = 0;
-  let filter = "", typing = false;
-  let drill: { kind: "album" | "playlist" | "artist"; title: string; tracks: Track[] } | null = null;
-  let now: Now = nowPlaying();
-  let lastFrame = ""; // art + border cache key
-  let accent = "";
-  let flashKey = "", flashUntil = 0; // status item to show briefly after its key
-  let ctx: { ids: string[]; names: string[]; artists: string[] } = { ids: [], names: [], artists: [] };
-  let ctxKey = ""; // play-context cache: refetch only when the context changes
-  let middleMode: "preview" | "lyrics" | "queue" = "preview"; // what the middle panel shows
-  let qCursor = 0; // selection inside the queue view
-  let lyr: { id: string; lines: LyricLine[]; loading?: boolean } | null = null;
-  let previewFetch: ReturnType<typeof setTimeout> | null = null;
-
+  // Set before the first backend call: a Music.app failure during the
+  // library load must still put the terminal back.
   const restore = () => {
     process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}?1049l${ESC}?25h`);
     process.stdin.setRawMode(false);
@@ -745,6 +1313,38 @@ async function tui() {
   const cleanup = () => { restore(); process.exit(0); };
   onFatal = restore;
   process.on("SIGINT", cleanup);
+
+  let library: Track[] = [];
+  let albums: AlbumEntry[] = [];
+  let artists: ArtistEntry[] = [];
+  let playlistNames: string[] = [];
+  let loading = true;
+  const playlistCache = new Map<string, Track[]>();
+  player.library().then((tracks) => {
+    library = tracks;
+    albums = groupAlbums(library);
+    artists = groupArtists(library);
+    loading = false;
+    draw();
+  });
+  player.playlists().then((names) => { playlistNames = names; draw(); });
+
+  // --- state
+  let tab = 0;
+  let cursor = 0, scroll = 0;
+  let filter = "", typing = false;
+  let drill: { kind: "album" | "playlist" | "artist"; title: string; tracks: Track[] } | null = null;
+  let now: Now = NO_NOW;
+  let up: Up[] = []; // what plays after the current track, refreshed each tick
+  let lastFrame = ""; // art + border cache key
+  let art: { id: string; png: string; accent: string } | null = null;
+  let artWanted = ""; // track id whose art we've already asked for
+  let pendingArt = false; // the screen was cleared: the image needs redrawing
+  let flashKey = "", flashUntil = 0; // status item to show briefly after its key
+  let middleMode: "preview" | "lyrics" | "queue" = "preview"; // what the middle panel shows
+  let qCursor = 0; // selection inside the queue view
+  let lyr: { id: string; lines: LyricLine[]; loading?: boolean } | null = null;
+  let previewFetch: ReturnType<typeof setTimeout> | null = null;
 
   type Item = { primary: string; secondary: string; id: string };
   const items = (): Item[] => {
@@ -812,12 +1412,27 @@ async function tui() {
   const schedulePlaylistFetch = (name: string) => {
     if (previewFetch) clearTimeout(previewFetch);
     previewFetch = setTimeout(() => {
-      if (!playlistCache.has(name)) playlistCache.set(name, loadPlaylistTracks(name));
-      draw();
+      if (playlistCache.has(name)) return;
+      player.playlistTracks(name).then((tracks) => { playlistCache.set(name, tracks); draw(); });
     }, 300);
   };
 
+  // Artwork loads off the draw path: one fetch per track, redraw when it
+  // lands. Until then the panel just has no accent color.
+  const ensureArt = () => {
+    const id = now.id;
+    artWanted = id;
+    player.art(now).then((a) => {
+      if (artWanted !== id) return; // the track moved on while we fetched
+      const [r, g, b] = a ? liftAccent(a.accent) : [0, 0, 0];
+      art = a ? { id, png: a.png, accent: `${ESC}38;2;${r};${g};${b}m` } : null;
+      pendingArt = true;
+      draw();
+    });
+  };
+
   const draw = () => {
+    const accent = art && art.id === now.id ? art.accent : "";
     const cols = process.stdout.columns, rows = process.stdout.rows;
     if (cols < 40 || rows < 13) {
       process.stdout.write(`${ESC}2J${ESC}1;1H${DIM}terminal too small${RESET}`);
@@ -826,10 +1441,10 @@ async function tui() {
     }
     const H = rows - 1; // last row is the footer
     // Layout: three equal columns when there's width; stacked when there isn't.
-    let player: Region, middle: Region | null = null, browse: Region | null = null;
+    let playerPane: Region, middle: Region | null = null, browse: Region | null = null;
     if (cols >= 90) {
       const w = Math.floor(cols / 3);
-      player = { x: 1, y: 1, w, h: H };
+      playerPane = { x: 1, y: 1, w, h: H };
       middle = { x: w + 1, y: 1, w, h: H };
       browse = { x: 2 * w + 1, y: 1, w: cols - 2 * w, h: H };
     } else if (rows >= 34) {
@@ -837,15 +1452,15 @@ async function tui() {
       // gets the rows that needs (middle and browse split what remains).
       const hp = H - 16; // leave ≥8 rows each for the other two panels
       const hm = Math.floor((H - hp) / 2);
-      player = { x: 1, y: 1, w: cols, h: hp };
+      playerPane = { x: 1, y: 1, w: cols, h: hp };
       middle = { x: 1, y: hp + 1, w: cols, h: hm };
       browse = { x: 1, y: hp + hm + 1, w: cols, h: H - hp - hm };
     } else if (rows >= 20) {
       const hp = H - 10; // browse keeps ≥10 rows
-      player = { x: 1, y: 1, w: cols, h: hp };
+      playerPane = { x: 1, y: 1, w: cols, h: hp };
       browse = { x: 1, y: hp + 1, w: cols, h: H - hp };
     } else {
-      player = { x: 1, y: 1, w: Math.min(cols, 48), h: H };
+      playerPane = { x: 1, y: 1, w: Math.min(cols, 48), h: H };
     }
     const stopped = now.state === "stopped" || !now.id;
 
@@ -854,6 +1469,7 @@ async function tui() {
     if (newFrame) {
       process.stdout.write(`\x1b_Ga=d,d=A,q=2\x1b\\${ESC}2J`);
       lastFrame = frame;
+      pendingArt = true;
     }
 
     const at = (x: number, y: number, text: string) => process.stdout.write(`${ESC}${y};${x}H${text}`);
@@ -904,7 +1520,10 @@ async function tui() {
         const item = list[scroll + i];
         let content: string;
         if (!item) {
-          content = scroll + i === 0 && list.length === 0 ? ` ${DIM}no matches${RESET}` + " ".repeat(inner - 11) : " ".repeat(inner);
+          const msg = loading ? "loading library…" : "no matches";
+          content = scroll + i === 0 && list.length === 0
+            ? ` ${DIM}${msg}${RESET}` + " ".repeat(Math.max(0, inner - msg.length - 1))
+            : " ".repeat(inner);
         } else {
           const isCursor = scroll + i === cursor;
           const playing = item.id && item.id === now.id ? "♪ " : "  ";
@@ -931,7 +1550,6 @@ async function tui() {
     if (middle) {
       const r = middle, inner = r.w - 2, w = inner - 2, roomRows = r.h - 2;
       if (middleMode === "queue") {
-        const up = upcoming();
         const box = panel(r, `queue · ${up.length}`);
         if (up.length === 0) {
           const msg = "queue is empty — a adds the hovered song";
@@ -1017,7 +1635,7 @@ async function tui() {
 
     // ---- player panel
     {
-      const r = player, inner = r.w - 2, x = r.x;
+      const r = playerPane, inner = r.w - 2, x = r.x;
       // Art on top, scaling with the window — bounded by panel width and
       // height, reserving rows for the up-next section when it can.
       let artA = Math.min(inner - 6, Math.max(28, (r.h - 19) * 2), (r.h - 13) * 2);
@@ -1028,15 +1646,10 @@ async function tui() {
       const title = stopped ? "◼ stopped" : now.state === "paused" ? "▮▮ paused" : "♪ playing";
       const box = panel(r, title);
 
-      if (newFrame && showArt) {
-        const art = fetchArt(now.id);
-        if (art) {
-          drawArt(art.png, x + 1 + Math.floor((inner - artA) / 2), r.y + 2, artA, artH);
-          const [rd, gn, bl] = liftAccent(art.accent);
-          accent = `${ESC}38;2;${rd};${gn};${bl}m`;
-        } else {
-          accent = "";
-        }
+      if (showArt && artWanted !== now.id) ensureArt();
+      if (showArt && pendingArt && art && art.id === now.id) {
+        drawArt(art.png, x + 1 + Math.floor((inner - artA) / 2), r.y + 2, artA, artH);
+        pendingArt = false;
       }
 
       const flashing = (k: string) => flashKey === k && Date.now() < flashUntil;
@@ -1069,10 +1682,9 @@ async function tui() {
         // with a blank row between entries so they read as separate songs.
         const nextY = infoY + 7;
         const maxY = r.y + r.h - 4; // keep the bottom rows for the status section
-        const up = upcoming();
         if (up.length > 0 && maxY - nextY >= 2) {
           // shuffle only shapes native contexts — the file queue plays in order
-          const header = now.shuffle && !activeQueue() ? "up next ⇄" : "up next";
+          const header = now.shuffle && player.upcomingShuffled(now) ? "up next ⇄" : "up next";
           at(x, nextY, `${DIM}├─ ${header} ${"─".repeat(Math.max(0, inner - header.length - 4))}┤${RESET}`);
           const w = inner - 2;
           let y = nextY + 1, j = 0, shown = 0;
@@ -1114,26 +1726,24 @@ async function tui() {
     });
   };
 
-  const tick = () => {
-    now = nowPlaying();
-    // Only a real user playlist (specialKind "none") is a queue Music will
-    // actually play through — single-song plays land in the special "Music"
-    // master playlist, whose order never plays. That's not a queue.
-    const key = now.plName && now.plSpecial === "none" ? `${now.plName}|${now.plCount}` : "";
-    if (key !== ctxKey) {
-      ctxKey = key;
-      ctx = key ? contextTracks() : { ids: [], names: [], artists: [] };
+  let ticking = false;
+  const tick = async () => {
+    if (ticking) return; // ponytail: drop overlapping ticks rather than queue them
+    ticking = true;
+    try {
+      now = await player.now();
+      up = await player.upcoming(now);
+    } finally {
+      ticking = false;
     }
     ensureLyrics();
     draw();
   };
-  // Music.app applies sets asynchronously; poll again shortly after acting
-  // so the panel catches up.
-  const act = (body: string, flash = "") => {
+  // Both backends apply changes asynchronously; poll again shortly after
+  // acting so the panel catches up.
+  const act = (done: Promise<unknown>, flash = "") => {
     if (flash) { flashKey = flash; flashUntil = Date.now() + 2500; }
-    jxa(body + `; return "";`);
-    tick();
-    setTimeout(tick, 400);
+    done.then(() => { tick(); setTimeout(tick, 400); });
   };
   const resetList = () => { cursor = 0; scroll = 0; filter = ""; typing = false; };
 
@@ -1150,8 +1760,16 @@ async function tui() {
     } else {
       const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
       if (!name) return;
-      if (!playlistCache.has(name)) playlistCache.set(name, loadPlaylistTracks(name));
-      drill = { kind: "playlist", title: name, tracks: playlistCache.get(name)! };
+      const open = (tracks: Track[]) => {
+        playlistCache.set(name, tracks);
+        drill = { kind: "playlist", title: name, tracks };
+        resetList();
+        draw();
+      };
+      const cached = playlistCache.get(name);
+      if (cached) open(cached);
+      else player.playlistTracks(name).then(open);
+      return;
     }
     resetList();
     draw();
@@ -1161,92 +1779,25 @@ async function tui() {
     if (drill) {
       const t = selected(drill.tracks, (x) => !filter || matches(x, filter));
       if (!t) return;
-      playTracks(drill.tracks.map(qt), t.id);
+      act(player.play(drill.tracks, t.id));
     } else if (tab === 0) {
       const t = selected(library, (x) => !filter || matches(x, filter));
-      if (t) playTracks([qt(t)]);
+      if (t) act(player.play([t]));
     } else if (tab === 1) {
       const a = selected(albums, (x) => !filter || matches({ name: x.name, artist: x.artist, album: "" }, filter));
-      if (a) playTracks(a.tracks.map(qt));
+      if (a) act(player.play(a.tracks));
     } else if (tab === 3) {
       const a = selected(artists, (x) => !filter || x.name.toLowerCase().includes(filter.toLowerCase()));
-      if (a) playTracks(a.tracks.map(qt));
+      if (a) act(player.play(a.tracks));
     } else {
       const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
-      if (name) playPlaylist(name);
+      if (name) act(player.playPlaylist(name));
     }
-    tick();
-    setTimeout(tick, 600); // give Music.app a beat, then show the new track
-  };
-
-  // The file queue, when it's really what Music is playing (or waiting
-  // behind the current track). A file that disagrees with reality is stale
-  // — the watcher stood down — and gets ignored.
-  const activeQueue = (): Queue | null => {
-    const q = readQueue();
-    if (!q) return null;
-    if (q.pos === -1 || q.tracks[q.pos]?.id === now.id) return q;
-    return null;
-  };
-
-  // What's coming after the current track: the file queue when active,
-  // otherwise the native play context (juke playlist).
-  const upcoming = (): { id: string; name: string; artist: string }[] => {
-    const q = activeQueue();
-    if (q) return upNext(q);
-    const curIdx = ctx.ids.indexOf(now.id);
-    if (curIdx < 0) return [];
-    return ctx.ids.slice(curIdx + 1).map((id, i) => ({
-      id, name: ctx.names[curIdx + 1 + i] || "", artist: ctx.artists[curIdx + 1 + i] || "",
-    }));
-  };
-
-  // Queue edits work on the file queue; editing while a native playlist
-  // plays adopts its upcoming tracks into a fresh file queue first, and the
-  // watcher owns playback from then on.
-  const editableQueue = (): Queue | null => {
-    const q = activeQueue();
-    if (q) return q;
-    const up = upcoming();
-    if (up.length === 0 || !now.id) return null;
-    return { tracks: [qt({ id: now.id, name: now.name, artist: now.artist }), ...up.map(qt)], pos: 0 };
-  };
-
-  const queueRemove = () => {
-    const q = editableQueue();
-    if (!q || upNext(q).length === 0) return;
-    writeQueue(removeUpcoming(q, Math.min(qCursor, upNext(q).length - 1)));
-    ensureWatcher();
-    draw();
-  };
-
-  const queueMove = (d: number) => {
-    const q = editableQueue();
-    if (!q) return;
-    const i = Math.min(qCursor, upNext(q).length - 1);
-    const moved = moveUpcoming(q, i, d);
-    if (!moved) return;
-    writeQueue(moved);
-    ensureWatcher();
-    qCursor = i + d;
-    draw();
-  };
-
-  const queueJump = () => {
-    const q = editableQueue();
-    if (!q || upNext(q).length === 0) return;
-    const target = q.pos + 1 + Math.min(qCursor, upNext(q).length - 1);
-    writeQueue({ tracks: q.tracks, pos: target });
-    playTrack(q.tracks[target]);
-    ensureWatcher();
-    qCursor = 0;
-    tick();
-    setTimeout(tick, 600);
   };
 
   // `a`: add the hovered thing to the queue (song, or whole album/playlist).
   const queueSelection = () => {
-    let sel: { id: string; name: string; artist: string }[] = [];
+    let sel: Sel[] = [];
     if (drill) {
       const t = selected(drill.tracks, (x) => !filter || matches(x, filter));
       if (t) sel = [t];
@@ -1261,15 +1812,19 @@ async function tui() {
       if (a) sel = a.tracks;
     } else {
       const name = selected(playlistNames, (n) => !filter || n.toLowerCase().includes(filter.toLowerCase()));
-      if (name) {
-        if (!playlistCache.has(name)) playlistCache.set(name, loadPlaylistTracks(name));
-        sel = playlistCache.get(name)!;
+      if (!name) return;
+      const cached = playlistCache.get(name);
+      if (cached) sel = cached;
+      else {
+        player.playlistTracks(name).then((tracks) => {
+          playlistCache.set(name, tracks);
+          if (tracks.length > 0) act(player.queue(tracks));
+        });
+        return;
       }
     }
     if (sel.length === 0) return;
-    queueTracks(sel.map(qt));
-    tick();
-    setTimeout(tick, 600); // let Music settle, then show the new queue
+    act(player.queue(sel));
   };
 
   process.stdin.on("data", (chunk: Buffer) => {
@@ -1294,10 +1849,13 @@ async function tui() {
       switch (k) {
         case "j": case `${ESC}B`: qCursor++; draw(); return;
         case "k": case `${ESC}A`: qCursor--; draw(); return;
-        case "x": queueRemove(); return;
-        case "J": queueMove(1); return;
-        case "K": queueMove(-1); return;
-        case "\r": queueJump(); return;
+        case "x": act(player.queueRemove(now, qCursor)); return;
+        case "J": case "K": {
+          const d = k === "J" ? 1 : -1;
+          player.queueMove(now, qCursor, d).then((i) => { qCursor = i; tick(); });
+          return;
+        }
+        case "\r": act(player.queueJump(now, qCursor).then(() => { qCursor = 0; })); return;
       }
     }
 
@@ -1319,17 +1877,13 @@ async function tui() {
         break;
       case "\r": playSelection(); return;
       case "a": queueSelection(); return;
-      case " ": act("music.playpause()"); return;
-      case `${ESC}C`:
-        if (queueNext()) { tick(); setTimeout(tick, 400); } else act("music.nextTrack()");
-        return;
-      case `${ESC}D`:
-        if (queuePrev()) { tick(); setTimeout(tick, 400); } else act("music.backTrack()");
-        return;
-      case "+": case "=": act("music.soundVolume = Math.min(100, music.soundVolume() + 5)", "vol"); return;
-      case "-": act("music.soundVolume = Math.max(0, music.soundVolume() - 5)", "vol"); return;
-      case "s": act("const v = !music.shuffleEnabled(); music.shuffleEnabled = v", "shuffle"); return;
-      case "r": act(`music.songRepeat = { off: "all", all: "one", one: "off" }[music.songRepeat()]`, "repeat"); return;
+      case " ": act(player.playpause()); return;
+      case `${ESC}C`: act(player.next()); return;
+      case `${ESC}D`: act(player.prev()); return;
+      case "+": case "=": act(player.volume(5), "vol"); return;
+      case "-": act(player.volume(-5), "vol"); return;
+      case "s": act(player.shuffle(), "shuffle"); return;
+      case "r": act(player.repeat(), "repeat"); return;
       case "q": cleanup();
       default: return;
     }
@@ -1349,7 +1903,7 @@ function requireQuery(query: string, usage: string): string {
   return query;
 }
 
-const HELP = `juke — Apple Music for the terminal
+const HELP = `juke — Apple Music for the terminal, through Music.app or Cider
 
 usage: juke [command] [query]
 
@@ -1365,10 +1919,16 @@ commands:
   pause             toggle play/pause
   next, prev        skip to the next / previous track
   shuffle           toggle shuffle
-  repeat            cycle repeat (off → all → one)
+  repeat            cycle repeat (Music: off → all → one; Cider: none → one → all)
 
 options:
   -h, --help        show this help
+
+environment:
+  JUKEBOX_CIDER_TOKEN   Cider's External Application API token (Settings →
+                        Connectivity). Set it and juke uses Cider when it's
+                        running, Music.app when it isn't.
+  JUKEBOX_PLAYER        cider | music — pick the backend by hand.
 
 TUI keys:
   j/k or ↑/↓ move · enter play · l open album/playlist · h back
@@ -1377,25 +1937,30 @@ TUI keys:
   / filter · esc clear · space pause · ←/→ prev/next · +/- volume
   s shuffle · r repeat · q quit
 
-lyrics come from lrclib.net (sends title/artist/duration when the view is open)`;
+lyrics come from Apple (on Cider) or lrclib.net (sends title/artist/duration
+when the view is open)`;
 
 function songLabel(s: Song): string {
   return `${s.name}  ${DIM}${s.artist} — ${s.album}${RESET}`;
 }
 
-function queueCmd(query: string) {
+async function queueCmd(query: string) {
   requireQuery(query, "usage: juke queue <query>");
-  const songs = searchLibrary(query);
+  const songs = await player.search(query);
   if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
   const picked = pickMany(songs.map(songLabel), "queue");
   if (picked.length === 0) return;
-  const mode = queueTracks(picked.map((i) => qt(songs[i])));
+  const mode = await player.queue(picked.map((i) => songs[i]));
   console.log(`queued ${picked.length} song${picked.length === 1 ? "" : "s"}${mode === "started" ? " — playing" : ""}`);
 }
 
-function main() {
+async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const query = rest.join(" ");
+
+  if (cmd === "watch") { watch(); return; } // hidden: the Music.app queue watcher
+  if (cmd === "-h" || cmd === "--help" || cmd === "help") { console.log(HELP); return; }
+  await choosePlayer(cmd === undefined);
 
   switch (cmd) {
     case undefined: {
@@ -1403,82 +1968,75 @@ function main() {
       return; // keeps the event loop alive
     }
     case "queue": {
-      if (!query) { showQueue(); break; }
-      queueCmd(query);
+      if (!query) { await showQueue(); break; }
+      await queueCmd(query);
       break;
     }
     case "play": {
-      if (rest[0] === "-q" || rest[0] === "--queue") { queueCmd(rest.slice(1).join(" ")); break; }
-      if (!query) { jxa(`music.play(); return "";`); break; }
-      const songs = searchLibrary(query);
+      if (rest[0] === "-q" || rest[0] === "--queue") { await queueCmd(rest.slice(1).join(" ")); break; }
+      if (!query) { await player.resume(); break; }
+      const songs = await player.search(query);
       if (songs.length === 0) { console.error(`no matches for "${query}"`); process.exit(1); }
       const i = pick(songs.map(songLabel), "play");
       if (i === null) return;
-      playTracks([qt(songs[i])]);
+      await player.play([songs[i]]);
       console.log(`▶ ${songs[i].name} — ${songs[i].artist}`);
       break;
     }
     case "album": {
       requireQuery(query, "usage: juke album <query>");
       const q = query.toLowerCase();
-      const albums = [...new Set(searchLibrary(query).map((s) => s.album))]
+      const albums = [...new Set((await player.search(query)).map((s) => s.album))]
         .filter((a) => a.toLowerCase().includes(q));
       if (albums.length === 0) { console.error(`no album matches "${query}"`); process.exit(1); }
       const i = pick(albums, "album");
       if (i === null) return;
-      playAlbum(albums[i]);
+      await player.playAlbum(albums[i]);
       console.log(`▶ ${albums[i]}`);
       break;
     }
     case "artist": {
       requireQuery(query, "usage: juke artist <query>");
       const q = query.toLowerCase();
-      const names = [...new Set(searchLibrary(query).map((s) => s.artist))]
+      const names = [...new Set((await player.search(query)).map((s) => s.artist))]
         .filter((a) => a.toLowerCase().includes(q));
       if (names.length === 0) { console.error(`no artist matches "${query}"`); process.exit(1); }
       const i = pick(names, "artist");
       if (i === null) return;
-      playArtist(names[i]);
+      await player.playArtist(names[i]);
       console.log(`▶ ${names[i]}`);
       break;
     }
     case "playlist": {
       requireQuery(query, "usage: juke playlist <query>");
       const q = query.toLowerCase();
-      const names: string[] = loadPlaylistNames().filter((n: string) => n.toLowerCase().includes(q));
+      const names = (await player.playlists()).filter((n) => n.toLowerCase().includes(q));
       if (names.length === 0) { console.error(`no playlist matches "${query}"`); process.exit(1); }
       const i = pick(names, "playlist");
       if (i === null) return;
-      playPlaylist(names[i]);
+      await player.playPlaylist(names[i]);
       console.log(`▶ ${names[i]}`);
       break;
     }
     case "search": {
       requireQuery(query, "usage: juke search <query>");
-      const songs = searchLibrary(query);
+      const songs = await player.search(query);
       if (songs.length === 0) { console.log("no matches"); return; }
       for (const s of songs) console.log(songLabel(s));
       break;
     }
-    case "pause": jxa(`music.playpause(); return "";`); break;
-    case "next": if (!queueNext()) jxa(`music.nextTrack(); return "";`); break;
-    case "prev": if (!queuePrev()) jxa(`music.backTrack(); return "";`); break;
-    case "watch": watch(); return; // hidden: the queue-advancing watcher
-    // Music.app applies sets asynchronously — reading right after returns the
-    // old value. Report the value we set, don't read it back.
+    case "pause": await player.playpause(); break;
+    case "next": await player.next(); break;
+    case "prev": await player.prev(); break;
     case "shuffle": {
-      const on = jxa(`const v = !music.shuffleEnabled(); music.shuffleEnabled = v; return JSON.stringify(v);`);
+      const on = await player.shuffle();
       console.log(`shuffle ${on ? "on" : "off"}`);
       break;
     }
     case "repeat": {
-      const mode = jxa(`const v = { off: "all", all: "one", one: "off" }[music.songRepeat()]; music.songRepeat = v; return JSON.stringify(v);`);
-      console.log(`repeat ${mode}`);
+      console.log(`repeat ${await player.repeat()}`);
       break;
     }
-    case "-h": case "--help": case "help":
-      console.log(HELP);
-      break;
     default:
       console.error(`juke: unknown command '${cmd}'`);
       console.error("try 'juke --help'");

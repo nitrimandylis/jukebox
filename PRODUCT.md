@@ -1,7 +1,8 @@
 # jukebox
 
 A single-file Bun CLI that plays my Apple Music library from the terminal by
-remote-controlling Music.app over AppleScript/JXA. Sibling in spirit to
+remote-controlling a real client: Music.app over AppleScript/JXA, or
+[Cider](https://cider.sh) over its local HTTP API. Sibling in spirit to
 [jazz](https://github.com/nitrimandylis/jazz) (same author-style: one file,
 zero runtime deps, compiled with `bun build --compile`).
 
@@ -35,6 +36,34 @@ register: product (a tool — design serves the product)
   `juke search`.
 - Artwork and lyrics cache to `~/.cache/jukebox` (persists across reboots).
 
+## Backends
+
+Everything above is one `Player` interface with two implementations, chosen
+at startup. Music.app is the default and the fallback. Cider 4 is used when
+`JUKEBOX_CIDER_TOKEN` is set *and* its local API (127.0.0.1:10767) answers a
+200; `JUKEBOX_PLAYER=cider|music` overrides. With no token nothing is probed,
+so Music.app users pay no startup latency; `JUKEBOX_PLAYER=cider` that can't
+connect is a hard error rather than a silent downgrade.
+
+Cider is a full peer, not a speaker: library, search, playback, queue, art
+and lyrics all come from it. It differs from Music.app in four places —
+its own queue replaces the queue file and the watcher entirely, the library
+arrives over paged HTTP (~3s measured for 1891 songs, so the browser fills in after the player
+panel is already live), lyrics are Apple's own TTML instead of lrclib, and
+there is no play count. `r` cycles none→one→all there (Cider exposes only a
+toggle) against Music's off→all→one.
+
+**Cider's queue is eventually consistent, and that is the landmine.** A write
+(`add-later`, `remove-by-index`) returns 200 roughly 500-870ms before either
+`/v1/playback/queue` or `/v2/queue/position` reflects it. Two consequences,
+both learned the expensive way: never confirm a write by reading the queue
+back — the read says nothing landed and re-adding on that evidence queues
+every song twice — and never send an index-based op from a read more than a
+second old, because the queue shifts underneath and any `play-item` (from us,
+from you, from Cider's own UI) replaces the whole queue with a single track.
+Where `add-later` genuinely needs a session to exist, we poll `now-playing`
+until `play-item`'s track is really current instead of counting.
+
 ## Design stance
 
 Terminal-native: default ANSI foreground + dim/bold for all chrome, one
@@ -43,11 +72,16 @@ codes. The album art is the only full-color element on screen.
 
 ## Constraints (accepted)
 
-- macOS only; drives Music.app (launches it if closed).
-- Library-only search — no Apple Music catalog (needs a paid developer token).
-- Music.app's real Up Next is not scriptable, so the queue is our own: a
-  JSON file (`~/.cache/jukebox/queue.json`) plus a detached watcher process
-  that plays the next track just before the current one ends (albums and
-  artists play through it too; real playlists play natively). No playlist
+- macOS only; drives Music.app (launches it if closed) or Cider.
+- Library-only search — no Apple Music catalog. Cider could serve one (its
+  API proxies the real Apple Music API on the user's own subscription), but
+  catalog search is the one non-parity feature and gets its own design pass.
+- **On Music.app:** its real Up Next is not scriptable, so the queue is our
+  own: a JSON file (`~/.cache/jukebox/queue.json`) plus a detached watcher
+  process that plays the next track just before the current one ends (albums
+  and artists play through it too; real playlists play natively). No playlist
   clutter in Music.app anymore — the trade is no gapless playback across
   queued tracks, and Music's shuffle/repeat don't apply to the file queue.
+  None of this exists on Cider, which has a real queue.
+- `juke queue` with no argument lists the current track and what follows,
+  not the tracks already played: only the Music backend remembers those.
