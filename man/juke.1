@@ -68,11 +68,14 @@ overrides the choice, and
 .B JUKEBOX_PLAYER=cider
 with no reachable Cider is an error rather than a silent downgrade.
 .PP
-The backends differ in four visible ways: Cider uses its own queue instead of
+The backends differ in five visible ways: Cider uses its own queue instead of
 the file queue and watcher below, its library arrives over HTTP (a couple of
 seconds, during which the browser says
 .IR "loading library\(u2026" ),
-its lyrics are Apple's own rather than lrclib's, and it reports no play count.
+its lyrics are Apple's own rather than lrclib's, it reports no play count,
+and
+.B search
+returns at most 25 matches there against 100 on Music.app.
 .SH ENVIRONMENT
 .TP
 .B JUKEBOX_CIDER_TOKEN

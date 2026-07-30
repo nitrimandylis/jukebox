@@ -937,6 +937,20 @@ async function ciderLibrary(): Promise<Track[]> {
   return out.sort((a, b) => b.added - a.added);
 }
 
+// Library list endpoints hand back 100 rows at a time and a `next` path;
+// follow it, or a 101-track album quietly loses its last song.
+async function amapiAll(path: string): Promise<any[]> {
+  const out: any[] = [];
+  let next: string | null = path;
+  while (next && out.length < 5000) { // ponytail: sanity stop, no library is that big
+    const res: any = await amapi(next);
+    if (!res?.data) break;
+    out.push(...res.data);
+    next = res.next ? dec(res.next) : null; // `next` arrives escaped, like everything else
+  }
+  return out;
+}
+
 let playlistIds: Record<string, string> = {}; // name → p.xxxx, filled by playlists()
 
 async function ciderPlaylists(): Promise<string[]> {
@@ -954,12 +968,12 @@ async function ciderPlaylists(): Promise<string[]> {
 async function ciderPlaylistTracks(name: string): Promise<Track[]> {
   const id = playlistIds[name];
   if (!id) return [];
-  const res = await amapi(`/v1/me/library/playlists/${id}/tracks?limit=${PAGE}`);
-  // ponytail: first 100 tracks — deeper playlists need paging, add it if one bites
-  return ciderTracks(res?.data || [], 0, 0);
+  return ciderTracks(await amapiAll(`/v1/me/library/playlists/${id}/tracks?limit=${PAGE}`), 0, 0);
 }
 
 // One request, unlike the library fetch: the commands must stay instant.
+// ponytail: 25 hits, because the library search genuinely caps there —
+// asking for 100 comes back empty rather than truncated.
 async function ciderSearch(query: string): Promise<Song[]> {
   const res = await amapi(
     `/v1/me/library/search?term=${encodeURIComponent(query)}&types=library-songs&limit=25`,
@@ -971,6 +985,20 @@ async function ciderSearch(query: string): Promise<Song[]> {
     artist: dec(it.attributes?.artistName || ""),
     album: dec(it.attributes?.albumName || ""),
   }));
+}
+
+// `juke album` hands over a name, not a track list. Song search is the wrong
+// tool for it twice over: it caps at 25 hits, so a long album arrives
+// truncated, and it returns relevance order, so the album plays scrambled.
+// Resolving the album itself gives every track, already in disc/track order.
+async function ciderAlbumTracks(name: string): Promise<Track[]> {
+  const res = await amapi(
+    `/v1/me/library/search?term=${encodeURIComponent(name)}&types=library-albums&limit=25`,
+  );
+  const albums = res?.results?.["library-albums"]?.data || [];
+  const album = albums.find((a: any) => dec(a.attributes?.name || "") === name) || albums[0];
+  if (!album) return [];
+  return ciderTracks(await amapiAll(`/v1/me/library/albums/${album.id}/tracks?limit=${PAGE}`), 0, 0);
 }
 
 // ---- playback
@@ -1154,13 +1182,13 @@ const ciderPlayer: Player = {
     return "queued";
   },
   // Albums and artists are just track lists — same two steps as everything else.
-  async playAlbum(name) {
-    const tracks = (await ciderSearch(name)).filter((s) => s.album === name);
-    await ciderPlay(tracks);
-  },
+  async playAlbum(name) { await ciderPlay(await ciderAlbumTracks(name)); },
+  // ponytail: the whole library (~3s) rather than a search, because search
+  // caps at 25 hits and this reuses the grouping the browser already uses,
+  // so `juke artist` and the artists tab play the identical track list.
   async playArtist(name) {
-    const tracks = (await ciderSearch(name)).filter((s) => s.artist === name);
-    await ciderPlay(tracks);
+    const artist = groupArtists(await ciderLibrary()).find((a) => a.name === name);
+    if (artist) await ciderPlay(artist.tracks);
   },
   async playPlaylist(name) {
     await ciderPlay(await ciderPlaylistTracks(name));

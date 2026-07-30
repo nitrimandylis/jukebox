@@ -51,7 +51,12 @@ its own queue replaces the queue file and the watcher entirely, the library
 arrives over paged HTTP (~3s measured for 1891 songs, so the browser fills in after the player
 panel is already live), lyrics are Apple's own TTML instead of lrclib, and
 there is no play count. `r` cycles none→one→all there (Cider exposes only a
-toggle) against Music's off→all→one.
+toggle) against Music's off→all→one, and `juke search` returns at most 25
+hits against Music's 100 — the library search endpoint caps there, and asking
+for more returns an empty result rather than a truncated one. `juke album`
+and `juke artist` therefore never go through search for their track lists:
+the album resolves to a real album id, and the artist reuses the browser's
+own grouping over the full library.
 
 **Cider's queue is eventually consistent, and that is the landmine.** A write
 (`add-later`, `remove-by-index`) returns 200 roughly 500-870ms before either
