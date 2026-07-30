@@ -1194,7 +1194,10 @@ const ciderPlayer: Player = {
     await ciderPlay(await ciderPlaylistTracks(name));
   },
   async resume() { await ciderPost("/api/v1/playback/play"); },
-  async playpause() { await ciderPost("/api/v1/playback/toggle"); },
+  // playpause, not toggle: `toggle` is a 404, and Cider's empty-body 400
+  // makes every wrong path look like it exists, so this was verified by
+  // watching the state actually flip.
+  async playpause() { await ciderPost("/api/v1/playback/playpause"); },
   async next() { await ciderPost("/api/v1/playback/next"); },
   async prev() { await ciderPost("/api/v1/playback/previous"); },
   async volume(delta) {
