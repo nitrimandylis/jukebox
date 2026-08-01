@@ -54,7 +54,7 @@ You need macOS, [Bun](https://bun.sh), Music.app (or Cider) with a library in it
 ```bash
 git clone https://github.com/nitrimandylis/jukebox.git
 cd jukebox
-bun run compile   # → ~/.bun/bin/juke, and man juke into your manpath
+bun run compile   # → ~/.bun/bin/juke, man juke, and the agent skill
 juke
 man juke          # the full command + TUI-key reference, offline
 ```
@@ -67,6 +67,14 @@ For the Cider backend, mint a token in Cider → Settings → Connectivity → E
 export JUKEBOX_CIDER_TOKEN=…      # cider when it's running, music.app when it isn't
 export JUKEBOX_PLAYER=cider       # optional: pin the backend (cider | music)
 ```
+
+## 🤖 The agent skill
+
+`juke-cli/SKILL.md` is an agent skill for driving `juke` — which commands run unattended (`pause`, `next`, `search`) and which open an fzf picker that only a human can answer, plus how the Music.app queue and its watcher actually behave. The traps that don't fit in
+`--help`, in other words. `bun run compile` copies it into `~/.claude/skills/`.
+
+It's a plain directory at the repo root rather than a `.claude/` one, because this repo is public and
+not everyone drives it with the same agent. Point yours at the file.
 
 ## 🔩 Under the hood
 
