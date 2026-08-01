@@ -70,11 +70,9 @@ export JUKEBOX_PLAYER=cider       # optional: pin the backend (cider | music)
 
 ## 🤖 The agent skill
 
-`juke-cli/SKILL.md` is an agent skill for driving `juke` — which commands run unattended (`pause`, `next`, `search`) and which open an fzf picker that only a human can answer, plus how the Music.app queue and its watcher actually behave. The traps that don't fit in
-`--help`, in other words. `bun run compile` copies it into `~/.claude/skills/`.
+`juke-cli/SKILL.md` is an agent skill for driving `juke` — which commands run unattended (`pause`, `next`, `search`) and which open an fzf picker that only a human can answer, plus how the Music.app queue and its watcher actually behave. The traps that don't fit in `--help`, in other words. `bun run compile` copies it into `~/.claude/skills/`.
 
-It's a plain directory at the repo root rather than a `.claude/` one, because this repo is public and
-not everyone drives it with the same agent. Point yours at the file.
+It's a plain directory at the repo root rather than a `.claude/` one, because this repo is public and not everyone drives it with the same agent. Point yours at the file.
 
 ## 🔩 Under the hood
 
