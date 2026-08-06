@@ -33,7 +33,11 @@ register: product (a tool — design serves the product)
   `juke queue <query>` (fzf multi-select songs to play next; bare `queue`
   shows what's coming), `juke album` / `juke artist` / `juke playlist`
   (pick and play whole), `juke pause|next|prev`, `juke shuffle|repeat`,
-  `juke search`.
+  `juke search`, `juke status` (what is playing, no TUI).
+- **`--json` is the machine interface**, on `status`, `search` and bare
+  `queue`. One JSON value on stdout, errors on stderr with a non-zero exit.
+  `status` exists because reading what is playing previously meant driving
+  Music.app or Cider yourself.
 - Artwork and lyrics cache to `~/.cache/jukebox` (persists across reboots).
 
 ## Backends
