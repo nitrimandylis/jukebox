@@ -39,6 +39,10 @@ Pick a playlist, play it.
 .B search <\fIquery\fR>
 List matching songs without playing.
 .TP
+.B status
+Print what is playing: track, position, volume, shuffle and repeat. Works
+against whichever backend is active and needs no terminal.
+.TP
 .B pause
 Toggle play/pause.
 .TP
@@ -56,6 +60,50 @@ toggle, so there it goes none \(-> one \(-> all.
 .TP
 .BR \-h ", " \-\-help
 Show help.
+.TP
+.B \-\-json
+Machine-readable output for
+.BR status ", " search " and bare " queue .
+Accepted in any position, and stripped before the query is assembled so it
+cannot be searched for. See
+.B JSON OUTPUT
+below.
+.SH JSON OUTPUT
+With
+.BR \-\-json ,
+stdout carries exactly one JSON value and nothing else; errors stay on stderr
+with a non-zero exit status.
+.TP
+.B juke status \-\-json
+One object:
+.IR backend " (\fBmusic\fR or \fBcider\fR), " state ", "
+.IR volume ", " shuffle ", " repeat ", and " track .
+.I track
+is
+.B null
+when nothing is loaded, and otherwise
+.IR "{id, name, artist, album, duration, position, year, favourite}" ,
+with times in seconds. Test
+.I track
+rather than
+.IR state :
+a stopped player still reports a volume and a repeat mode.
+.TP
+.B juke search \fIquery\fB \-\-json
+An array of
+.IR "{id, name, artist, album}" ,
+empty when nothing matches.
+.TP
+.B juke queue \-\-json
+One object:
+.IR playing ", " up " and " approximate .
+.I playing
+is
+.B null
+when nothing is loaded. When
+.I approximate
+is true the order is a guess, because shuffle reshapes the backend's own
+context and the list cannot be read exactly.
 .SH BACKENDS
 Music.app is the default. Cider 4 is used instead when
 .B JUKEBOX_CIDER_TOKEN
@@ -71,7 +119,7 @@ with no reachable Cider is an error rather than a silent downgrade.
 The backends differ in five visible ways: Cider uses its own queue instead of
 the file queue and watcher below, its library arrives over HTTP (a couple of
 seconds, during which the browser says
-.IR "loading library\(u2026" ),
+.IR "loading library\[u2026]" ),
 its lyrics are Apple's own rather than lrclib's, it reports no play count,
 and
 .B search

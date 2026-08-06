@@ -8,5 +8,8 @@
   },
   "scripts": {
     "compile": "bun build --compile jukebox.ts --outfile ~/.bun/bin/juke && mkdir -p $(brew --prefix)/share/man/man1 && cp man/juke.1 $(brew --prefix)/share/man/man1/ && ([ -d ~/.claude/skills ] && cp -R juke-cli ~/.claude/skills/ || true)"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
   }
 }

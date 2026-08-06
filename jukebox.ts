@@ -363,12 +363,51 @@ async function watch() {
 
 // ponytail: the current track and what follows it — played tracks are no
 // longer listed, because only the Music backend keeps a history of them.
-async function showQueue() {
+async function showQueue(json = false) {
   const now = await player.now();
   const up = await player.upcoming(now);
+  if (json) {
+    return void console.log(JSON.stringify({
+      playing: now.id ? { id: now.id, name: now.name, artist: now.artist, album: now.album } : null,
+      // Music's native contexts reshape under shuffle, so the order below is a
+      // guess rather than a promise. Say which it is instead of hiding it.
+      approximate: player.upcomingShuffled(now),
+      up: up.map((t) => ({ id: t.id, name: t.name, artist: t.artist })),
+    }));
+  }
   if (!now.id && up.length === 0) { console.log("queue is empty — juke queue <query>"); return; }
   if (now.id) console.log(`♪ ${now.name}  ${DIM}${now.artist}${RESET}`);
   for (const t of up) console.log(`  ${t.name}  ${DIM}${t.artist}${RESET}`);
+}
+
+/**
+ * What is playing, without the TUI.
+ *
+ * This is the one read every script wants and the one juke had no command for:
+ * `now()` existed but only the full-screen interface called it, so anything
+ * outside had to drive the backend itself.
+ */
+async function showStatus(json: boolean) {
+  const now = await player.now();
+  if (json) {
+    return void console.log(JSON.stringify({
+      backend: player.kind,
+      state: now.state,
+      // A stopped player still reports a volume and a repeat mode; the track
+      // fields are the ones that go null, so a consumer can test one thing.
+      track: now.id ? {
+        id: now.id, name: now.name, artist: now.artist, album: now.album,
+        duration: now.duration, position: now.pos, year: now.year || null, favourite: now.fav,
+      } : null,
+      volume: now.vol,
+      shuffle: now.shuffle,
+      repeat: now.repeat,
+    }));
+  }
+  if (!now.id) return void console.log(`${now.state} — nothing playing`);
+  const mmss = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+  console.log(`${now.state === "playing" ? "▶" : "❚❚"} ${now.name}  ${DIM}${now.artist} — ${now.album}${RESET}`);
+  console.log(`  ${mmss(now.pos)} / ${mmss(now.duration)}  ${DIM}vol ${now.vol}  shuffle ${now.shuffle ? "on" : "off"}  repeat ${now.repeat}${RESET}`);
 }
 
 // Command-line album play: no cache to hand, so resolve the album in JXA.
@@ -1964,6 +2003,7 @@ commands:
   artist <query>    pick an artist, play everything by them
   playlist <query>  pick a playlist, play it
   search <query>    list matching songs without playing
+  status            what is playing right now
   pause             toggle play/pause
   next, prev        skip to the next / previous track
   shuffle           toggle shuffle
@@ -1971,6 +2011,7 @@ commands:
 
 options:
   -h, --help        show this help
+  --json            machine-readable output (status, search, queue)
 
 environment:
   JUKEBOX_CIDER_TOKEN   Cider's External Application API token (Settings →
@@ -2003,7 +2044,10 @@ async function queueCmd(query: string) {
 }
 
 async function main() {
-  const [cmd, ...rest] = process.argv.slice(2);
+  // --json is stripped before the query is joined, so it never ends up being
+  // searched for as part of a title.
+  const json = process.argv.includes("--json");
+  const [cmd, ...rest] = process.argv.slice(2).filter((a) => a !== "--json");
   const query = rest.join(" ");
 
   if (cmd === "watch") { watch(); return; } // hidden: the Music.app queue watcher
@@ -2016,10 +2060,11 @@ async function main() {
       return; // keeps the event loop alive
     }
     case "queue": {
-      if (!query) { await showQueue(); break; }
+      if (!query) { await showQueue(json); break; }
       await queueCmd(query);
       break;
     }
+    case "status": await showStatus(json); break;
     case "play": {
       if (rest[0] === "-q" || rest[0] === "--queue") { await queueCmd(rest.slice(1).join(" ")); break; }
       if (!query) { await player.resume(); break; }
@@ -2069,6 +2114,7 @@ async function main() {
     case "search": {
       requireQuery(query, "usage: juke search <query>");
       const songs = await player.search(query);
+      if (json) { console.log(JSON.stringify(songs)); break; }
       if (songs.length === 0) { console.log("no matches"); return; }
       for (const s of songs) console.log(songLabel(s));
       break;

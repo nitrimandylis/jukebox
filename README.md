@@ -46,6 +46,7 @@ nick@jukebox:~$ juke play "not like us"
 | 04 | **queue** | `a` adds the hovered thing, the queue view (`⇥`) has its own cursor: enter jumps, `x` removes, `J/K` reorder — all plain file edits, because apple's real up next is scripting-proof |
 | 05 | **lyrics** | time-synced — apple's own TTML on cider, lrclib.net (keyless) on music.app, which never shares its own. current line highlighted and auto-scrolled, cached in `~/.cache/jukebox` |
 | 06 | **quick commands** | `juke play/queue/album/artist/playlist/search` with fzf picking (multi-select for queue) — the extras, for when the TUI is overkill |
+| 07 | **`juke status`** | what's playing, no TUI. `--json` on `status`, `search` and `queue` for scripts and status bars |
 
 ## 🚀 Run it
 
