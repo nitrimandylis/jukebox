@@ -170,3 +170,26 @@ test("parseTTML survives the escaping Cider's API proxy adds", () => {
   const dec = (s: string) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
   expect(parseTTML(dec(escaped))).toEqual([{ t: 1.5, text: "me & you" }]);
 });
+
+// `juke status --help` used to print the status: --help was only recognised in
+// the first position, and any other flag was swallowed into the search query.
+// `status` stands in for every subcommand and is read-only if this regresses.
+test("--help wins anywhere, and unknown options are rejected", () => {
+  const { spawnSync } = require("node:child_process");
+  const run = (args: string[]) =>
+    spawnSync("bun", [`${import.meta.dir}/jukebox.ts`, ...args], { encoding: "utf8" });
+
+  for (const args of [["--help"], ["-h"], ["status", "--help"], ["search", "x", "-h"]]) {
+    const r = run(args);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("juke — Apple Music for the terminal");
+  }
+
+  const bad = run(["status", "--bogus"]);
+  expect(bad.status).toBe(1);
+  expect(bad.stderr).toContain("unknown option --bogus");
+
+  // the documented flags must still pass through
+  expect(run(["--json", "--help"]).status).toBe(0);
+  expect(run(["play", "-q", "--help"]).status).toBe(0);
+});

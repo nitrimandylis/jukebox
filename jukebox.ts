@@ -2044,14 +2044,33 @@ async function queueCmd(query: string) {
 }
 
 async function main() {
+  const argv = process.argv.slice(2);
+
+  // --help wins wherever it appears. It used to be checked only in the first
+  // position, so `juke status --help` printed the status instead of the help.
+  if (argv.includes("-h") || argv.includes("--help") || argv[0] === "help") {
+    console.log(HELP);
+    return;
+  }
+
+  // A typo'd flag used to be swallowed into the search query and the command
+  // ran anyway, exiting 0. Only the four documented flags are accepted; a
+  // query never legitimately starts with a dash.
+  const KNOWN_FLAGS = ["--json", "-q", "--queue"];
+  const unknown = argv.find((a) => a.startsWith("-") && a !== "-" && !KNOWN_FLAGS.includes(a));
+  if (unknown) {
+    console.error(`juke: unknown option ${unknown}`);
+    console.error("try 'juke --help'");
+    process.exit(1);
+  }
+
   // --json is stripped before the query is joined, so it never ends up being
   // searched for as part of a title.
-  const json = process.argv.includes("--json");
-  const [cmd, ...rest] = process.argv.slice(2).filter((a) => a !== "--json");
+  const json = argv.includes("--json");
+  const [cmd, ...rest] = argv.filter((a) => a !== "--json");
   const query = rest.join(" ");
 
   if (cmd === "watch") { watch(); return; } // hidden: the Music.app queue watcher
-  if (cmd === "-h" || cmd === "--help" || cmd === "help") { console.log(HELP); return; }
   await choosePlayer(cmd === undefined);
 
   switch (cmd) {
