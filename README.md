@@ -14,6 +14,8 @@
 
 ![runtime](https://img.shields.io/badge/runtime-bun-fa2f48?style=flat-square&labelColor=111111) ![platform](https://img.shields.io/badge/platform-macos_only-fa2f48?style=flat-square&labelColor=111111) ![deps](https://img.shields.io/badge/runtime_deps-0-ff9f0a?style=flat-square&labelColor=111111) ![backends](https://img.shields.io/badge/backends-music.app_+_cider-ff9f0a?style=flat-square&labelColor=111111) ![license](https://img.shields.io/badge/license-MIT-fa2f48?style=flat-square&labelColor=111111)
 
+![jukebox](.github/assets/juke.png)
+
 </div>
 
 ---
