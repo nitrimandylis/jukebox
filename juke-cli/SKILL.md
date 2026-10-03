@@ -25,6 +25,7 @@ juke shuffle           # toggle shuffle
 juke repeat            # cycle repeat
 juke queue             # show the current queue (no query = show, don't add)
 juke play              # with no query: resume playback
+juke help              # usage, same as --help
 ```
 
 With `--json`, for parsing rather than printing:
@@ -32,7 +33,7 @@ With `--json`, for parsing rather than printing:
 ```bash
 juke status --json     # {backend, state, track, volume, shuffle, repeat} — track is null when idle
 juke search <q> --json # [{id, name, artist, album}]
-juke queue --json      # {playing, up, approximate}
+juke queue --json      # {playing, up, approximate}; up is [{id, name, artist}]
 ```
 
 `juke search` is the right tool when the user asks "is X in my library". It never starts anything.
@@ -50,7 +51,7 @@ When the user asks for something specific to play, give them the command to run:
 ```bash
 juke album "the color and the shape"
 juke play "not like us"
-juke queue "modern jazz"      # or: juke play -q "modern jazz"
+juke queue "modern jazz"      # or: juke play -q "modern jazz" (--queue is the long form of -q)
 ```
 
 If they want it started without a picker, use `juke search <query>` first to confirm the track exists and

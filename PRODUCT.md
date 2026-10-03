@@ -28,7 +28,8 @@ register: product (a tool — design serves the product)
   available — the current line highlights and auto-scrolls; cached per track,
   fetched only while the view is open). Status items (shuffle/repeat/volume)
   appear only when non-default, flashing briefly after their key. Transport
-  keys are global: space pause, ←/→ skip, +/- volume, s/r modes.
+  keys are global: space pause, ←/→ skip, +/- volume, s/r modes. `g`/`G` jump
+  to the top / bottom of the list.
 - **Quick commands are the extras**: `juke play <query>` (fzf-pick a song),
   `juke queue <query>` (fzf multi-select songs to play next; bare `queue`
   shows what's coming), `juke album` / `juke artist` / `juke playlist`

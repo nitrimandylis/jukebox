@@ -24,8 +24,14 @@ Pick songs to play next — appended to juke's own queue on Music.app (see
 or to Cider's. With no query, show the current track and what follows it.
 .TP
 .B play \-q <\fIquery\fR>
+.TQ
+.B play \-\-queue <\fIquery\fR>
 Same as
 .BR queue .
+.TP
+.B help
+Show help and exit. Same as
+.BR \-\-help .
 .TP
 .B album <\fIquery\fR>
 Pick an album, play it in order.
@@ -61,6 +67,14 @@ toggle, so there it goes none \(-> one \(-> all.
 .BR \-h ", " \-\-help
 Show help and exit, from any position and alongside any command.
 An unrecognised option is an error: nothing runs and the exit status is 1.
+.TP
+.BR \-q ", " \-\-queue
+Only after
+.BR play :
+long and short form of the flag that makes
+.B play
+behave like
+.BR queue .
 .TP
 .B \-\-json
 Machine-readable output for
@@ -98,6 +112,10 @@ empty when nothing matches.
 .B juke queue \-\-json
 One object:
 .IR playing ", " up " and " approximate .
+Each
+.I up
+item is
+.IR "{id, name, artist}" .
 .I playing
 is
 .B null
@@ -137,6 +155,8 @@ pick the backend by hand.
 .SH TUI KEYS
 .B j/k
 or arrows move,
+.B g/G
+jump to the top / bottom of the list,
 .B enter
 play,
 .B l

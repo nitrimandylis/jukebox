@@ -13,7 +13,7 @@
 // Usage: juke                      the TUI (browser + player) — the main way
 //        juke play [query]         pick a song and play it (no query: resume)
 //        juke queue [query]        pick songs to play next (no query: show queue)
-//        juke play -q <query>      same as juke queue
+//        juke play -q <query>      same as juke queue (--queue is the long form)
 //        juke album <query>        pick an album, play it in order
 //        juke artist <query>       pick an artist, play everything by them
 //        juke playlist <query>     pick a playlist, play it
@@ -21,7 +21,7 @@
 //        juke pause | next | prev  transport
 //        juke shuffle | repeat     toggle / cycle
 //
-// TUI keys: j/k move · 1/2/3 switch tabs · ⇥ preview/lyrics · / filter
+// TUI keys: j/k move · g/G top/bottom · 1/2/3/4 switch tabs · ⇥ preview/lyrics · / filter
 //           enter play · a add to queue · l open album/playlist · h back
 //           ␣ pause · ←/→ prev/next · +/- volume · s/r shuffle/repeat · q quit
 
@@ -1998,7 +1998,8 @@ commands:
   (none)            open the TUI
   play [query]      pick a song and play it (no query: resume playback)
   queue [query]     pick songs to play next (no query: show the queue)
-  play -q <query>   same as queue
+  play -q <query>   same as queue (--queue is the long form of -q)
+  help              show this help
   album <query>     pick an album, play it in order
   artist <query>    pick an artist, play everything by them
   playlist <query>  pick a playlist, play it
@@ -2011,6 +2012,7 @@ commands:
 
 options:
   -h, --help        show this help
+  -q, --queue       with play: same as queue (play -q <query>)
   --json            machine-readable output (status, search, queue)
 
 environment:
@@ -2020,7 +2022,7 @@ environment:
   JUKEBOX_PLAYER        cider | music — pick the backend by hand.
 
 TUI keys:
-  j/k or ↑/↓ move · enter play · l open album/playlist · h back
+  j/k or ↑/↓ move · g/G top/bottom · enter play · l open album/playlist · h back
   a add to queue · 1/2/3/4 switch tabs · tab cycles preview/lyrics/queue
   queue view: j/k select · enter play · x remove · J/K reorder
   / filter · esc clear · space pause · ←/→ prev/next · +/- volume
